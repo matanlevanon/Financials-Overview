@@ -1,0 +1,30 @@
+name = "finance-overview"
+main = "worker.js"
+compatibility_date = "2026-08-01"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "finance-overview"
+# Paste the id printed by `wrangler d1 create finance-overview`
+database_id = ""
+
+# Daily sync. Cloudflare crons run in UTC. 04:00 UTC suits a European morning.
+# Pick a time that lands overnight where you are.
+[triggers]
+crons = ["0 4 * * *"]
+
+# Secrets are set with `wrangler secret put NAME`, never written in this file:
+#   PLAID_CLIENT_ID
+#   PLAID_SECRET
+#   SESSION_SECRET
+#   GOOGLE_LOGIN_CLIENT_ID
+#   GOOGLE_LOGIN_CLIENT_SECRET
+#   ALLOWED_EMAILS
+# Optional:
+#   PLAID_REDIRECT_URI     required for OAuth banks such as Chase
+#   SLACK_WEBHOOK_URL      enables alerts
+#   ALERT_LARGE_TX         default 1000
+#   ALERT_LOW_BALANCE      default 500
+#   ALERT_PREFIX           label prepended to Slack alerts
+#   SYNC_DAYS              days of transaction history, default 30
+#   PLAID_ENV              production (default) or sandbox
