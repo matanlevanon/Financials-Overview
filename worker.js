@@ -866,12 +866,12 @@ td.name{max-width:none}
     <div class="cap" id="capAssets"></div><div id="assets"></div>
   </div>
   <div class="card">
-    <div class="card-head"><h2>Spending by category</h2><button class="btn-clear" id="clearCat" data-clear="category">Clear</button></div>
-    <div class="cap" id="capCat"></div><div id="cats"></div>
-  </div>
-  <div class="card">
     <div class="card-head"><h2>Cards</h2><button class="btn-clear" id="clearCards" data-clear="account">Clear</button></div>
     <div class="cap" id="capCards"></div><div id="cards"></div>
+  </div>
+  <div class="card">
+    <div class="card-head"><h2>Spending by category</h2><button class="btn-clear" id="clearCat" data-clear="category">Clear</button></div>
+    <div class="cap" id="capCat"></div><div id="cats"></div>
   </div>
 </div>
 
