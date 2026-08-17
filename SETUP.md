@@ -115,6 +115,18 @@ Press **Sync now** and read the dashboard.
 
 After that the cron runs daily. Default is 04:00 UTC, set in `wrangler.toml`. Pick an hour that lands overnight where you live.
 
+## Optional: investment holdings
+
+Brokerage positions come from a second Plaid product, `investments`, consented per
+institution when you link. Anything you link with the current code asks for it up front.
+
+A connection made before that consent existed returns a balance and no positions. The
+Holdings panel says so. To fix it, open **Link a bank**, press **Add investments** on that
+connection, walk through the bank's consent screen, then press **Sync now**.
+
+Institutions that do not offer investments answer with a code instead of positions. The
+sync status line names the institution and the reason.
+
 ## Optional: Slack alerts
 
 Alerts fire for transactions above a threshold and cash balances below one.

@@ -1,12 +1,16 @@
 # Finance Overview
 
-A self-hosted dashboard for your own bank accounts and credit cards. You deploy your own copy. Your financial data stays inside your Cloudflare account and reaches nobody else.
+A self-hosted dashboard for your own bank accounts. You deploy your own copy. Your financial data stays inside your Cloudflare account and reaches nobody else.
+
+**[See the landing page](https://matanlevanon.github.io/Financials-Overview/)**
 
 ![Dashboard](docs/dashboard.png)
 
 ## What this is
 
-One page showing every account you own. Balances, credit cards, spending by category, and a transaction list you filter by clicking.
+One page showing every account you own. Balances, credit cards, spending by category, top merchants, recurring charges, investment holdings, and a transaction list you filter by clicking.
+
+The tiles pack into three columns and the transaction list holds the right third of the screen, scrolling on its own so the tiles stay in place. On a phone everything collapses to one column.
 
 Everything runs on Cloudflare's free tier. A daily cron job pulls fresh data from your banks through Plaid, writes to a private D1 database, and the dashboard reads from there. Sign-in uses Google, restricted to an email allowlist you control.
 
@@ -21,9 +25,13 @@ All screenshots on this page use demo data.
 
 ## Screenshots
 
-Click any row to filter. Filters combine, so an account plus a category shows only that category inside that account.
+Every account, category and merchant row is a filter. Filters combine, so one card plus one category shows only that spending on that card. The chips at the top show what is on, and each block clears on its own.
 
-![Filtered by travel](docs/filtered.png)
+![Two filters active, one card and one category](docs/filtered.png)
+
+Plaid guesses a category for each merchant and sometimes gets it wrong. Set the category once and every transaction from that merchant follows, past and future.
+
+![The categories dialog](docs/categories.png)
 
 Some issuers do not report a credit line through Plaid. Enter yours and utilisation calculates against your figure.
 
@@ -33,9 +41,9 @@ Sign-in is restricted to the email addresses you allowlist.
 
 <img src="docs/login.png" alt="Sign in" width="520">
 
-The layout adapts down to a phone.
+The three columns collapse to one on a phone. Same data, same filters.
 
-<img src="docs/mobile.png" alt="Mobile layout" width="380">
+<img src="docs/mobile.png" alt="Mobile layout" width="330">
 
 ## What you need
 
@@ -57,8 +65,8 @@ Zero at this scale. Cloudflare Workers, D1, and cron triggers sit inside the fre
 Full walkthrough in [SETUP.md](SETUP.md). Short version:
 
 ```bash
-git clone <your-fork-url>
-cd finance-overview
+git clone https://github.com/matanlevanon/Financials-Overview.git
+cd Financials-Overview
 
 wrangler d1 create finance-overview
 # paste the printed database_id into wrangler.toml
@@ -75,6 +83,14 @@ wrangler deploy
 ```
 
 Open the deployed URL, sign in, and click Link a bank. Plaid Link runs in the browser and handles two-factor prompts. Your bank credentials go to Plaid and never touch this app.
+
+## Investment holdings
+
+Brokerage accounts break out position by position, with value, share of the portfolio, and gain against cost basis.
+
+Consent is granted per product when you link, so a bank linked before you asked for investments returns a balance and no positions. The Holdings panel says so rather than hiding itself. Open **Link a bank**, press **Add investments** on that connection, walk through the consent, then press **Sync now**. Anything you link from now on asks for it up front.
+
+Not every institution offers the investments product. When one declines, the sync status line names the institution and the reason.
 
 ## How the numbers are calculated
 
@@ -106,7 +122,8 @@ Review the code before you deploy it. This handles your bank data.
 - US and Canadian banks only, through Plaid.
 - Capital One does not report credit limits or available credit through Plaid. Enter those in the Credit limits dialog.
 - Chase and Capital One are OAuth institutions and need `PLAID_REDIRECT_URI`. Chase also requires a security questionnaire before granting OAuth access, and approval takes time.
-- Transaction history is limited to `SYNC_DAYS`, default 30.
+- Transaction history is limited to `SYNC_DAYS`, default 180.
+- Recurring charges need a few months of history before they show anything useful.
 - An optional OpenFinance path exists in `worker.js`, dormant unless `OPENFINANCE_API_KEY` is set. Plaid is the supported provider.
 
 ## Files
@@ -118,6 +135,7 @@ Review the code before you deploy it. This handles your bank data.
 | `wrangler.toml` | Worker config, D1 binding, cron schedule. |
 | `favicon.svg` | Icon, served from `/favicon.svg`. |
 | `SETUP.md` | Step by step setup. |
+| `docs/` | Landing page and screenshots. Published with GitHub Pages. |
 
 ## Licence
 
