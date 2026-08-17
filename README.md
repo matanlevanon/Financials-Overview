@@ -1,6 +1,6 @@
 # Finance Overview
 
-A self-hosted dashboard for your own bank accounts. You deploy your own copy. Your financial data stays inside your Cloudflare account and reaches nobody else.
+A self-hosted dashboard for your own bank accounts and credit cards. You deploy your own copy. Your financial data stays inside your Cloudflare account and reaches nobody else.
 
 ![Dashboard](docs/dashboard.png)
 
