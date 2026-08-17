@@ -44,3 +44,27 @@ CREATE TABLE IF NOT EXISTS plaid_items (
   institution TEXT,
   added_at TEXT NOT NULL
 );
+
+-- Investment holdings, one row per account+security. Replaced wholesale each
+-- sync so a sold position disappears rather than lingering.
+CREATE TABLE IF NOT EXISTS holdings (
+  id TEXT PRIMARY KEY,         -- account_id:security_id
+  account_id TEXT NOT NULL,
+  ticker TEXT,
+  name TEXT NOT NULL,
+  type TEXT,                   -- equity, etf, mutual fund, cash, crypto
+  sector TEXT,
+  quantity REAL,
+  cost_basis REAL,
+  value REAL NOT NULL,
+  currency TEXT,
+  updated_at TEXT NOT NULL
+);
+
+-- Your category corrections, keyed on the merchant name. Applied when the
+-- dashboard is built, so a change recategorises history without a re-sync.
+CREATE TABLE IF NOT EXISTS category_overrides (
+  merchant TEXT PRIMARY KEY,
+  category TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);

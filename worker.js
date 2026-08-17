@@ -263,14 +263,53 @@ async function fetchItem(env, item, startDate, endDate) {
   return { accounts, transactions };
 }
 
+// Investment holdings. Included on the Plaid Trial plan. Items with no
+// investment accounts return PRODUCTS_NOT_SUPPORTED, which is not an error
+// worth surfacing.
+async function fetchHoldings(env, item) {
+  let r;
+  try {
+    r = await plaid(env, "/investments/holdings/get", { access_token: item.access_token });
+  } catch (err) {
+    // Consent is granted per product when you link, so an institution linked
+    // for transactions alone answers with a code rather than positions. Carry
+    // the code back instead of swallowing it, so an empty panel has a reason.
+    if (["PRODUCTS_NOT_SUPPORTED", "PRODUCT_NOT_READY", "NO_INVESTMENT_ACCOUNTS",
+         "INVALID_PRODUCT", "ADDITIONAL_CONSENT_REQUIRED"].includes(err.code)) {
+      const skipped = [];
+      skipped.note = err.code;
+      return skipped;
+    }
+    throw err;
+  }
+  const sec = Object.fromEntries((r.securities || []).map((s) => [s.security_id, s]));
+  return (r.holdings || []).map((h) => {
+    const s = sec[h.security_id] || {};
+    return {
+      // one row per account+security, so a re-sync updates rather than duplicates
+      id: `${h.account_id}:${h.security_id}`,
+      account_id: h.account_id,
+      ticker: s.ticker_symbol || null,
+      name: s.name || s.ticker_symbol || "Holding",
+      type: s.type || null,
+      sector: s.sector || null,
+      quantity: h.quantity == null ? null : Number(h.quantity),
+      cost_basis: h.cost_basis == null ? null : Number(h.cost_basis),
+      value: Number(h.institution_value ?? 0),
+      currency: h.iso_currency_code || "USD"
+    };
+  });
+}
+
 async function fetchFromPlaid(env) {
   const items = await listItems(env);
-  const days = Number(env.SYNC_DAYS || 30);
+  const days = Number(env.SYNC_DAYS || 180);
   const startDate = new Date(Date.now() - days * 86400000).toISOString().slice(0, 10);
   const endDate = new Date().toISOString().slice(0, 10);
 
   const accounts = [];
   const transactions = [];
+  const holdings = [];
   const errors = [];
 
   for (const item of items) {
@@ -278,6 +317,13 @@ async function fetchFromPlaid(env) {
       const r = await fetchItem(env, item, startDate, endDate);
       accounts.push(...r.accounts);
       transactions.push(...r.transactions);
+      try {
+        const hs = await fetchHoldings(env, item);
+        holdings.push(...hs);
+        if (hs.note) errors.push(`${item.institution || item.item_id} holdings: ${hs.note}`);
+      } catch (err) {
+        errors.push(`${item.institution || item.item_id} holdings: ${err.message}`);
+      }
       if (item.last_error) await setItemError(env, item.item_id, null);
     } catch (err) {
       // One broken connection must not stop the others syncing.
@@ -286,7 +332,7 @@ async function fetchFromPlaid(env) {
     }
   }
 
-  return { accounts, transactions, errors };
+  return { accounts, transactions, holdings, errors };
 }
 
 /* ------------------------------------------------------------ open finance */
@@ -322,7 +368,7 @@ async function fetchFromOpenFinance(env) {
   }));
 
   const currencyOf = new Map(accounts.map((a) => [a.id, a.currency]));
-  const days = Number(env.SYNC_DAYS || 30);
+  const days = Number(env.SYNC_DAYS || 180);
   const startDate = new Date(Date.now() - days * 86400000).toISOString().slice(0, 10);
   const transactions = [];
   let cursor = null;
@@ -352,6 +398,28 @@ async function fetchFromOpenFinance(env) {
 }
 
 /* ------------------------------------------------------------------ store */
+
+// Holdings are a full snapshot each sync: replace rather than merge, so a
+// position you sold disappears instead of lingering.
+async function storeHoldings(env, holdings) {
+  const now = new Date().toISOString();
+  const accountIds = [...new Set(holdings.map((h) => h.account_id))];
+  for (let i = 0; i < accountIds.length; i += 40) {
+    const c = accountIds.slice(i, i + 40);
+    await env.DB.prepare(
+      `DELETE FROM holdings WHERE account_id IN (${c.map(() => "?").join(",")})`
+    ).bind(...c).run();
+  }
+  const stmts = holdings.map((h) => env.DB.prepare(
+    `INSERT INTO holdings (id, account_id, ticker, name, type, sector, quantity, cost_basis, value, currency, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(id) DO UPDATE SET
+       quantity=excluded.quantity, cost_basis=excluded.cost_basis,
+       value=excluded.value, updated_at=excluded.updated_at`
+  ).bind(h.id, h.account_id, h.ticker, h.name, h.type, h.sector,
+         h.quantity, h.cost_basis, h.value, h.currency, now));
+  for (let i = 0; i < stmts.length; i += 40) await env.DB.batch(stmts.slice(i, i + 40));
+}
 
 async function store(env, accounts, transactions) {
   const now = new Date().toISOString();
@@ -469,12 +537,14 @@ async function runAlerts(env, accounts, transactions) {
 async function syncNow(env) {
   const accounts = [];
   const transactions = [];
+  const holdings = [];
   const errors = [];
 
   if (env.PLAID_CLIENT_ID && env.PLAID_SECRET) {
     const r = await fetchFromPlaid(env);
     accounts.push(...r.accounts);
     transactions.push(...r.transactions);
+    holdings.push(...(r.holdings || []));
     errors.push(...r.errors);
   }
 
@@ -489,9 +559,11 @@ async function syncNow(env) {
   }
 
   await store(env, accounts, transactions);
+  if (holdings.length) await storeHoldings(env, holdings);
   const alerts = await runAlerts(env, accounts, transactions);
 
-  return { ok: true, accounts: accounts.length, transactions: transactions.length, alerts, errors };
+  return { ok: true, accounts: accounts.length, transactions: transactions.length,
+           holdings: holdings.length, alerts, errors };
 }
 
 /* -------------------------------------------------------------- link page */
@@ -550,13 +622,19 @@ async function loadLinked() {
         : (i.last_error ? '<span class="warn">' + i.last_error + '</span>' : '<span class="ok">OK</span>');
       const dupe = seen[i.institution] > 1 ? ' <span class="dupe">linked ' + seen[i.institution] + 'x</span>' : '';
       return '<tr><td>' + i.institution + dupe + '</td><td>' + i.added_at.slice(0,10) + '</td><td>' + cell +
-        '</td><td class="act"><button class="small danger" data-rm="' + i.item_id + '">Remove</button></td></tr>';
+        '</td><td class="act"><button class="small" data-inv="' + i.item_id + '">Add investments</button> ' +
+        '<button class="small danger" data-rm="' + i.item_id + '">Remove</button></td></tr>';
     }).join('') + '</tbody></table>' +
     '<p class="sub" style="margin-top:10px">Removing revokes the connection at Plaid and deletes its accounts and ' +
     'transactions from your database. On the Plaid Trial plan this does not free a slot.</p>';
 
   el.querySelectorAll('button[data-item]').forEach(b => {
     b.onclick = () => openLink(b.getAttribute('data-item'), b);
+  });
+  // Positions need the investments product, which is consented per institution
+  // at link time. Anything linked before that consent existed needs this once.
+  el.querySelectorAll('button[data-inv]').forEach(b => {
+    b.onclick = () => openLink(b.getAttribute('data-inv'), b, true);
   });
   // Two-step confirm rather than a browser dialog.
   el.querySelectorAll('button[data-rm]').forEach(b => {
@@ -591,14 +669,14 @@ async function loadLinked() {
 loadLinked();
 
 // itemId set = update mode, re-authenticating an existing connection.
-async function openLink(itemId, btn) {
+async function openLink(itemId, btn, investments) {
   btn.disabled = true;
   status.textContent = 'Preparing...';
   try {
     const res = await fetch('/api/link/token', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(itemId ? { item_id: itemId } : {})
+      body: JSON.stringify(itemId ? { item_id: itemId, investments: !!investments } : {})
     });
     const body = await res.json();
     if (!res.ok) throw new Error(body.error || 'could not create link token');
@@ -609,7 +687,9 @@ async function openLink(itemId, btn) {
         // In update mode the access_token is unchanged, so there is nothing
         // to exchange. Only a fresh link produces a token worth saving.
         if (body.update) {
-          status.textContent = 'Reconnected. Press Sync now on the dashboard.';
+          status.textContent = investments
+            ? 'Investments added. Press Sync now on the dashboard.'
+            : 'Reconnected. Press Sync now on the dashboard.';
           btn.disabled = false;
           loadLinked();
           return;
@@ -649,6 +729,9 @@ async function handleDashboard(env, email) {
   const txRows = await env.DB.prepare(
     "SELECT date, name, amount, category, account_id, pending FROM transactions ORDER BY date DESC LIMIT 800"
   ).all();
+  const holdRows = await env.DB.prepare("SELECT * FROM holdings ORDER BY value DESC").all();
+  const ovRows = await env.DB.prepare("SELECT merchant, category FROM category_overrides").all();
+  const overrides = Object.fromEntries((ovRows.results || []).map((r) => [r.merchant, r.category]));
   const lastSync = (acctRows.results[0] && acctRows.results[0].updated_at) || null;
 
   const accounts = (acctRows.results || []).map((a) => ({
@@ -658,16 +741,12 @@ async function handleDashboard(env, email) {
     type: a.type || "",
     cur: a.currency,
     bal: Number(a.balance) || 0,
-    // Precedence: a limit you entered yourself, then the issuer's reported
-    // limit, then a reconstruction from available credit. Capital One reports
-    // neither, which is why the manual override exists.
     limit: a.type !== "credit card" ? null
       : a.manual_limit != null ? Number(a.manual_limit)
       : a.credit_limit != null ? Number(a.credit_limit)
       : a.available != null ? Number(a.available) + Number(a.balance)
       : null,
     manual: a.manual_limit != null,
-    // what the issuer reports, so clearing an override can fall back without a reload
     reported: a.type !== "credit card" ? null
       : a.credit_limit != null ? Number(a.credit_limit)
       : a.available != null ? Number(a.available) + Number(a.balance)
@@ -678,14 +757,18 @@ async function handleDashboard(env, email) {
     date: t.date,
     name: t.name,
     amount: Number(t.amount) || 0,
-    category: t.category || "OTHER",
+    category: overrides[t.name] || t.category || "OTHER",
     account: t.account_id,
     pending: t.pending ? 1 : 0
   }));
 
-  // Embedded as JSON so filtering is instant and client-side. The page already
-  // sits behind the Google login, so this exposes nothing new.
-  const payload = JSON.stringify({ accounts, tx, email, lastSync }).replace(/</g, "\\u003c");
+  const holdings = (holdRows.results || []).map((h) => ({
+    account: h.account_id, ticker: h.ticker, name: h.name, type: h.type,
+    qty: h.quantity, cost: h.cost_basis, value: Number(h.value) || 0
+  }));
+
+  const payload = JSON.stringify({ accounts, tx, holdings, overrides, email, lastSync })
+    .replace(/</g, "\\u003c");
 
   return html(`<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><title>Finance Overview</title>
@@ -704,197 +787,227 @@ async function handleDashboard(env, email) {
   --assets:#2a78d6;--debt:#e34948;--good:#006300;--sel:rgba(42,120,214,.10);--sel-line:#2a78d6}
 *{box-sizing:border-box}
 body{margin:0;background:var(--plane);color:var(--text-primary);
-  font-family:system-ui,-apple-system,"Segoe UI",sans-serif;padding:26px 30px 60px}
-header{display:flex;justify-content:space-between;align-items:flex-start;gap:20px;flex-wrap:wrap;margin-bottom:16px}
-h1{font-size:15px;font-weight:600;margin:0 0 3px}
-.sub{color:var(--muted);font-size:12.5px}
-.who{color:var(--muted);font-size:12.5px;text-align:right;margin-bottom:8px}
+  font-family:system-ui,-apple-system,"Segoe UI",sans-serif;padding:14px 16px 20px;font-size:13px}
+
+header{display:flex;justify-content:space-between;align-items:center;gap:14px;flex-wrap:wrap;margin-bottom:10px}
+h1{font-size:14px;font-weight:600;margin:0}
+.sub{color:var(--muted);font-size:11.5px}
+.who{color:var(--muted);font-size:11.5px}
 .who a{color:var(--muted)}
 button,a.btn{background:var(--card);color:var(--text-secondary);border:1px solid var(--border);
-  border-radius:8px;padding:7px 13px;font-size:12.5px;cursor:pointer;font-family:inherit;
+  border-radius:7px;padding:5px 10px;font-size:11.5px;cursor:pointer;font-family:inherit;
   text-decoration:none;display:inline-block}
 button:hover,a.btn:hover{border-color:var(--muted);color:var(--text-primary)}
 button:disabled{opacity:.5;cursor:default}
-.controls{display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end}
-.filterbar{display:flex;align-items:center;gap:9px;flex-wrap:wrap;margin-bottom:16px;min-height:34px;
-  font-size:12.5px;color:var(--muted)}
-.chip{display:inline-flex;align-items:center;gap:8px;background:var(--sel);border:1px solid var(--sel-line);
-  border-radius:999px;padding:5px 8px 5px 12px;color:var(--text-primary);font-size:12.5px}
-.chip button{background:none;border:0;color:var(--text-secondary);padding:0 2px;font-size:14px;line-height:1}
-.hero-wrap{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:22px 24px;
-  margin-bottom:14px;display:flex;justify-content:space-between;align-items:flex-end;gap:30px;flex-wrap:wrap}
-.hero-label{font-size:11.5px;color:var(--muted);text-transform:uppercase;letter-spacing:.07em;margin-bottom:7px}
-.hero-figure{font-size:50px;font-weight:600;line-height:1;letter-spacing:-.02em}
-.hero-note{font-size:12.5px;color:var(--muted);margin-top:9px}
-.split{min-width:270px;flex:1;max-width:400px}
-.split-label{font-size:11.5px;color:var(--muted);margin-bottom:9px;display:flex;justify-content:space-between}
-.split-bar{display:flex;height:32px;gap:2px}
-.split-seg{border-radius:4px}
-.split-seg.a{background:var(--assets)}.split-seg.d{background:var(--debt)}
-.split-legend{display:flex;gap:16px;margin-top:10px;font-size:12px;flex-wrap:wrap}
-.split-legend span{display:flex;align-items:center;gap:7px;color:var(--text-secondary)}
-.dot{width:9px;height:9px;border-radius:2px}
-.dot.a{background:var(--assets)}.dot.d{background:var(--debt)}
-.legend-val{color:var(--text-primary);font-weight:500}
-.kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(172px,1fr));gap:12px;margin-bottom:14px}
-.kpi{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:14px 16px}
-.kpi .k{font-size:11.5px;color:var(--muted);margin-bottom:6px}
-.kpi .v{font-size:22px;font-weight:600}
-.kpi .d{font-size:11.5px;color:var(--text-secondary);margin-top:5px}
-.kpi .d.good{color:var(--good)}
-.grid3{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin-bottom:14px;align-items:start}
-.grid3>*{min-width:0}
-@media(max-width:1180px){.grid3{grid-template-columns:1fr 1fr}}
-@media(max-width:760px){.grid3{grid-template-columns:1fr}}
-.card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:17px 19px;min-width:0;overflow:hidden}
-.card-head{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;margin-bottom:3px}
-.card h2{font-size:13px;font-weight:600;margin:0}
-.card .cap{font-size:11.5px;color:var(--muted);margin-bottom:16px;line-height:1.5}
-.btn-clear{font-size:11px;padding:4px 9px;border-radius:6px;flex:none;visibility:hidden}
+.controls{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
+
+.filterbar{display:flex;align-items:center;gap:7px;flex-wrap:wrap;margin-bottom:10px;min-height:26px;
+  font-size:11.5px;color:var(--muted)}
+.chip{display:inline-flex;align-items:center;gap:6px;background:var(--sel);border:1px solid var(--sel-line);
+  border-radius:999px;padding:3px 7px 3px 10px;color:var(--text-primary);font-size:11.5px}
+.chip button{background:none;border:0;color:var(--text-secondary);padding:0 2px;font-size:13px;line-height:1}
+
+/* tiles take two thirds, transactions the right third */
+.page{display:grid;grid-template-columns:2fr 1fr;gap:12px;align-items:start}
+@media(max-width:1150px){.page{grid-template-columns:1fr}}
+.colL{display:flex;flex-direction:column;gap:9px;min-width:0}
+.colR{min-width:0}
+
+.card{background:var(--card);border:1px solid var(--border);border-radius:11px;padding:10px 12px;min-width:0;overflow:hidden}
+.card-head{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:2px}
+.card h2{font-size:11.5px;font-weight:600;margin:0;letter-spacing:.01em}
+.card .cap{font-size:10.5px;color:var(--muted);margin-bottom:9px;line-height:1.45}
+.btn-clear{font-size:10px;padding:2px 7px;border-radius:5px;flex:none;visibility:hidden}
 .btn-clear.on{visibility:visible}
-.row{margin:0 -8px 4px;padding:7px 8px 9px;border-radius:8px;cursor:pointer;border:1px solid transparent}
+
+.hero{display:flex;justify-content:space-between;align-items:flex-end;gap:16px;flex-wrap:wrap}
+.hero-label{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.07em;margin-bottom:4px}
+.hero-figure{font-size:29px;font-weight:600;line-height:1;letter-spacing:-.02em}
+.split{min-width:180px;flex:1;max-width:260px}
+.split-bar{display:flex;height:20px;gap:2px;margin-bottom:6px}
+.split-seg{border-radius:3px}
+.split-seg.a{background:var(--assets)}.split-seg.d{background:var(--debt)}
+.split-legend{display:flex;gap:12px;font-size:11px;flex-wrap:wrap}
+.split-legend span{display:flex;align-items:center;gap:5px;color:var(--text-secondary)}
+.dot{width:8px;height:8px;border-radius:2px}
+.dot.a{background:var(--assets)}.dot.d{background:var(--debt)}
+
+.kpis{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}
+@media(max-width:560px){.kpis{grid-template-columns:1fr 1fr}}
+.kpi{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:9px 10px}
+.kpi .k{font-size:10px;color:var(--muted);margin-bottom:3px}
+.kpi .v{font-size:16px;font-weight:600;letter-spacing:-.01em}
+.kpi .d{font-size:10px;color:var(--text-secondary);margin-top:2px;line-height:1.35}
+.kpi .d.good{color:var(--good)}
+
+/* Three independent stacks rather than a grid. Grid would align row heights
+   and leave a gap under every short tile. Each column packs its own cards. */
+.panels{display:flex;gap:9px;align-items:flex-start}
+.pcol{flex:1 1 0;min-width:0;display:flex;flex-direction:column;gap:9px}
+@media(max-width:1150px){.panels{flex-wrap:wrap}.pcol{flex:1 1 300px}}
+@media(max-width:700px){.panels{flex-direction:column;align-items:stretch}.pcol{flex:1 1 auto}}
+
+.row{margin:0 -6px 2px;padding:5px 6px 6px;border-radius:6px;cursor:pointer;border:1px solid transparent}
 .row:hover{background:var(--sel)}
 .row.sel{background:var(--sel);border-color:var(--sel-line)}
 .row.dim{opacity:.32}
-.row-top{display:flex;justify-content:space-between;font-size:12.5px;margin-bottom:6px;gap:12px;min-width:0}
+.row-top{display:flex;justify-content:space-between;font-size:11.5px;margin-bottom:4px;gap:8px;min-width:0}
 .row-name{color:var(--text-secondary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;flex:1 1 auto}
 .row.sel .row-name{color:var(--text-primary)}
 .row-val{color:var(--text-primary);font-weight:500;flex:none;font-variant-numeric:tabular-nums}
-.track{height:9px;background:var(--grid);border-radius:4px;overflow:hidden}
-.fill{height:100%;border-radius:4px}
-.meta{font-size:10.5px;color:var(--muted);margin-top:5px;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
-.linkbtn{background:none;border:0;color:var(--assets);font-size:10.5px;padding:0;cursor:pointer;
-  text-decoration:underline;font-family:inherit}
-.linkbtn:hover{color:var(--text-primary)}
-.badge{font-size:9.5px;border:1px solid var(--border);border-radius:4px;padding:1px 5px;color:var(--muted)}
+.track{height:6px;background:var(--grid);border-radius:3px;overflow:hidden}
+.fill{height:100%;border-radius:3px}
+.meta{font-size:9.5px;color:var(--muted);margin-top:3px;display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.badge{font-size:9px;border:1px solid var(--border);border-radius:3px;padding:0 4px;color:var(--muted)}
+
+/* category pills, colour is redundant: the label is always present */
+.pill{display:inline-flex;align-items:center;gap:4px;font-size:9.5px;padding:1px 6px;border-radius:4px;
+  white-space:nowrap;color:var(--text-primary);background:color-mix(in srgb, var(--c) 22%, transparent);
+  border:1px solid color-mix(in srgb, var(--c) 55%, transparent)}
+.pill i{width:5px;height:5px;border-radius:50%;background:var(--c);flex:none}
+
+/* transactions, Copilot-style grouped list */
+.txcard{display:flex;flex-direction:column;position:sticky;top:14px;max-height:calc(100vh - 32px)}
+@media(max-width:1150px){.txcard{position:static;max-height:none}}
+#txwrap{overflow-y:auto;flex:1;margin:0 -4px;padding:0 4px}
+.tx-day{font-size:9.5px;color:var(--muted);text-transform:uppercase;letter-spacing:.07em;
+  padding:9px 2px 4px;position:sticky;top:0;background:var(--card);z-index:1}
+.tx-row{display:flex;align-items:center;gap:9px;padding:6px 6px;border-radius:7px;
+  border-bottom:1px solid var(--grid);cursor:default}
+.tx-row:hover{background:var(--sel)}
+.tx-main{flex:1;min-width:0}
+.tx-name{font-size:12px;color:var(--text-primary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.tx-sub{font-size:10px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.tx-amt{font-variant-numeric:tabular-nums;font-size:12px;font-weight:500;flex:none;text-align:right}
+.tx-row.xfer{opacity:.45}
+.neg{color:var(--debt)}.pos{color:var(--good)}
+.tag{font-size:9px;border:1px solid var(--border);border-radius:3px;padding:0 4px;color:var(--muted);margin-left:5px}
+.tag.pend{border-color:#fab219;color:#fab219}
+.empty{color:var(--muted);font-size:11.5px;padding:14px 4px;text-align:center;font-style:italic}
+#status{font-size:11px;color:var(--muted)}
+.hold-t{font-size:9.5px;color:var(--muted);margin-left:5px}
+.gain{color:var(--good)}.loss{color:var(--debt)}
+
+/* modals */
 .modal{position:fixed;inset:0;background:rgba(0,0,0,.6);display:flex;align-items:center;
   justify-content:center;padding:20px;z-index:100}
 .modal[hidden]{display:none}
-.modal-card{background:var(--card);border:1px solid var(--border);border-radius:14px;
+.modal-card{background:var(--card);border:1px solid var(--border);border-radius:13px;
   width:100%;max-width:560px;max-height:86vh;display:flex;flex-direction:column;overflow:hidden}
-.modal-head{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;
-  padding:20px 22px 0}
-.modal-head h2{font-size:14px;font-weight:600;margin:0 0 3px}
-.modal-body{padding:14px 22px;overflow-y:auto}
-.modal-foot{display:flex;justify-content:flex-end;gap:9px;padding:14px 22px 20px;
+.modal-head{padding:18px 20px 0}
+.modal-head h2{font-size:13px;font-weight:600;margin:0 0 3px}
+.modal-body{padding:12px 20px;overflow-y:auto}
+.modal-foot{display:flex;justify-content:flex-end;gap:8px;padding:12px 20px 18px;
   border-top:1px solid var(--grid);margin-top:auto}
 .modal-foot .primary{background:var(--assets);border-color:var(--assets);color:#fff}
-.modal-foot .primary:hover{opacity:.9;color:#fff}
-.limrow{display:flex;align-items:center;gap:12px;padding:11px 0;border-bottom:1px solid var(--grid)}
+.modal .note{font-size:11px;color:var(--muted);line-height:1.5;margin:0 0 4px}
+.limrow{display:flex;align-items:center;gap:10px;padding:9px 0;border-bottom:1px solid var(--grid)}
 .limrow:last-child{border-bottom:0}
 .limrow .who{flex:1;min-width:0}
-.limrow .nm{font-size:12.5px;color:var(--text-primary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.limrow .sb{font-size:11px;color:var(--muted);margin-top:2px}
-.limrow input{background:var(--plane);border:1px solid var(--border);border-radius:7px;
-  color:var(--text-primary);font-size:13px;padding:7px 9px;width:120px;font-family:inherit;
-  text-align:right;font-variant-numeric:tabular-nums}
-.limrow input:focus{outline:none;border-color:var(--assets)}
-.modal .note{font-size:11.5px;color:var(--muted);line-height:1.55;margin:0 0 6px}
-#limstatus{font-size:12px;color:var(--muted);margin-right:auto;align-self:center}
-table{width:100%;border-collapse:collapse;font-size:12.5px}
-th{text-align:left;color:var(--muted);font-weight:400;font-size:10.5px;text-transform:uppercase;
-  letter-spacing:.06em;padding:7px 9px;border-bottom:1px solid var(--baseline)}
-td{padding:9px;border-bottom:1px solid var(--grid);color:var(--text-secondary)}
-td.name{color:var(--text-primary)}
-td.num{text-align:right;font-variant-numeric:tabular-nums;color:var(--text-primary)}
-.neg{color:var(--debt)}.pos{color:var(--good)}
-tr.xfer td{opacity:.45}
-.tag{font-size:10px;border:1px solid var(--border);border-radius:4px;padding:1px 6px;color:var(--muted);margin-left:6px}
-.tag.pend{border-color:var(--warning);color:var(--warning)}
-.empty{color:var(--muted);font-size:12.5px;padding:20px 4px;text-align:center;font-style:italic}
-#status{font-size:12.5px;color:var(--muted);margin-left:4px}
-/* the table is the widest thing on the page: let it scroll inside its card
-   rather than pushing past the rounded background */
-#txwrap{overflow-x:auto;-webkit-overflow-scrolling:touch}
-#txwrap table{min-width:100%}
-td.name{max-width:none}
-.sub-meta{display:none;color:var(--muted);font-size:11px;margin-top:3px}
-@media(max-width:760px){
-  body{padding:18px 14px 48px}
-  .hero-wrap{padding:18px 16px}
-  .hero-figure{font-size:38px}
-  .kpis{grid-template-columns:1fr 1fr;gap:10px}
-  .kpi{padding:12px 13px}
-  .kpi .v{font-size:19px}
-  .kpi .k,.kpi .d{font-size:11px}
-  .card{padding:15px 15px}
-  /* drop Account and Category columns; they reappear under the name */
-  th:nth-child(3),th:nth-child(4),td:nth-child(3),td:nth-child(4){display:none}
-  .sub-meta{display:block}
-  th,td{padding:8px 6px}
-  td:first-child,th:first-child{white-space:nowrap}
-  header{gap:12px}
-  .controls{justify-content:flex-start}
-  .who{text-align:left}
-}
+.limrow .nm{font-size:12px;color:var(--text-primary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.limrow .sb{font-size:10.5px;color:var(--muted);margin-top:1px}
+.limrow input,.limrow select{background:var(--plane);border:1px solid var(--border);border-radius:6px;
+  color:var(--text-primary);font-size:12px;padding:6px 8px;font-family:inherit}
+.limrow input{width:110px;text-align:right;font-variant-numeric:tabular-nums}
+.limrow select{width:180px}
+.limrow input:focus,.limrow select:focus{outline:none;border-color:var(--assets)}
+#limstatus,#catstatus{font-size:11px;color:var(--muted);margin-right:auto;align-self:center}
 </style></head>
 <body>
 <header>
   <div><h1>Finance Overview</h1><div class="sub" id="subtitle"></div></div>
-  <div>
-    <div class="who">${esc(email)} &nbsp;<a href="/logout">Sign out</a></div>
-    <div class="controls">
-      <a class="btn" href="/link">Link a bank</a>
-      <button id="sync">Sync now</button>
-      <button id="limits">Credit limits</button>
-      <button id="theme">Light</button>
-      <span id="status"></span>
-    </div>
+  <div class="controls">
+    <span class="who">${esc(email)} <a href="/logout">Sign out</a></span>
+    <a class="btn" href="/link">Link a bank</a>
+    <button id="sync">Sync now</button>
+    <button id="limits">Credit limits</button>
+    <button id="cats-btn">Categories</button>
+    <button id="theme">Light</button>
+    <span id="status"></span>
   </div>
 </header>
 
 <div class="filterbar" id="filterbar"></div>
 
-<div class="hero-wrap">
-  <div>
-    <div class="hero-label">Net worth</div>
-    <div class="hero-figure" id="hero">—</div>
-    <div class="hero-note">What you own minus what you owe on cards. Balances ignore filters.</div>
-  </div>
-  <div class="split">
-    <div class="split-label"><span>Composition</span><span id="gross"></span></div>
-    <div class="split-bar" id="splitbar"></div>
-    <div class="split-legend" id="splitlegend"></div>
-  </div>
-</div>
+<div class="page">
+  <div class="colL">
+    <div class="card">
+      <div class="hero">
+        <div>
+          <div class="hero-label">Net worth</div>
+          <div class="hero-figure" id="hero">—</div>
+        </div>
+        <div class="split">
+          <div class="split-bar" id="splitbar"></div>
+          <div class="split-legend" id="splitlegend"></div>
+        </div>
+      </div>
+    </div>
 
-<div class="kpis" id="kpis"></div>
+    <div class="kpis" id="kpis"></div>
 
-<div class="grid3">
-  <div class="card">
-    <div class="card-head"><h2>Where the money sits</h2><button class="btn-clear" id="clearAssets" data-clear="account">Clear</button></div>
-    <div class="cap" id="capAssets"></div><div id="assets"></div>
+    <div class="panels">
+      <div class="pcol">
+        <div class="card">
+          <div class="card-head"><h2>Where the money sits</h2><button class="btn-clear" id="clearAssets" data-clear="account">Clear</button></div>
+          <div class="cap" id="capAssets"></div><div id="assets"></div>
+        </div>
+        <div class="card">
+          <div class="card-head"><h2>Top merchants</h2><button class="btn-clear" id="clearMerch" data-clear="merchant">Clear</button></div>
+          <div class="cap" id="capMerch"></div><div id="merch"></div>
+        </div>
+      </div>
+      <div class="pcol">
+        <div class="card">
+          <div class="card-head"><h2>Cards</h2><button class="btn-clear" id="clearCards" data-clear="account">Clear</button></div>
+          <div class="cap" id="capCards"></div><div id="cards"></div>
+        </div>
+        <div class="card" id="recurCard">
+          <div class="card-head"><h2>Recurring</h2></div>
+          <div class="cap" id="capRecur"></div><div id="recur"></div>
+        </div>
+      </div>
+      <div class="pcol">
+        <div class="card">
+          <div class="card-head"><h2>Spending by category</h2><button class="btn-clear" id="clearCat" data-clear="category">Clear</button></div>
+          <div class="cap" id="capCat"></div><div id="cats"></div>
+        </div>
+        <div class="card" id="holdCard">
+          <div class="card-head"><h2>Holdings</h2></div>
+          <div class="cap" id="capHold"></div><div id="holds"></div>
+        </div>
+      </div>
+    </div>
   </div>
-  <div class="card">
-    <div class="card-head"><h2>Cards</h2><button class="btn-clear" id="clearCards" data-clear="account">Clear</button></div>
-    <div class="cap" id="capCards"></div><div id="cards"></div>
-  </div>
-  <div class="card">
-    <div class="card-head"><h2>Spending by category</h2><button class="btn-clear" id="clearCat" data-clear="category">Clear</button></div>
-    <div class="cap" id="capCat"></div><div id="cats"></div>
-  </div>
-</div>
 
-<div class="card">
-  <div class="card-head"><h2>Transactions</h2><button class="btn-clear" id="clearTx" data-clear="all">Clear all</button></div>
-  <div class="cap" id="capTx"></div><div id="txwrap"></div>
+  <div class="colR">
+    <div class="card txcard">
+      <div class="card-head"><h2>Transactions</h2><button class="btn-clear" id="clearTx" data-clear="all">Clear all</button></div>
+      <div class="cap" id="capTx"></div>
+      <div id="txwrap"></div>
+    </div>
+  </div>
 </div>
 
 <div class="modal" id="limmodal" hidden>
-  <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="limtitle">
-    <div class="modal-head">
-      <div>
-        <h2 id="limtitle">Credit limits</h2>
-        <p class="note">Some issuers do not report a credit line through Plaid. Enter it here and
-        utilisation is calculated against your figure. Leave blank to use whatever the bank reports.</p>
-      </div>
-    </div>
+  <div class="modal-card" role="dialog" aria-modal="true">
+    <div class="modal-head"><h2>Credit limits</h2>
+      <p class="note">Some issuers do not report a credit line through Plaid. Enter it here and
+      utilisation is calculated against your figure. Leave blank to use whatever the bank reports.</p></div>
     <div class="modal-body" id="limrows"></div>
-    <div class="modal-foot">
-      <span id="limstatus"></span>
-      <button id="limcancel">Cancel</button>
-      <button id="limsave" class="primary">Save</button>
-    </div>
+    <div class="modal-foot"><span id="limstatus"></span>
+      <button id="limcancel">Cancel</button><button id="limsave" class="primary">Save</button></div>
+  </div>
+</div>
+
+<div class="modal" id="catmodal" hidden>
+  <div class="modal-card" role="dialog" aria-modal="true">
+    <div class="modal-head"><h2>Categories</h2>
+      <p class="note">Plaid guesses a category and sometimes gets it wrong. Set one here and every
+      transaction from that merchant uses it, past and future. Automatic keeps Plaid's guess.</p></div>
+    <div class="modal-body" id="catrows"></div>
+    <div class="modal-foot"><span id="catstatus"></span>
+      <button id="catcancel">Cancel</button><button id="catsave" class="primary">Save</button></div>
   </div>
 </div>
 
@@ -902,21 +1015,39 @@ td.name{max-width:none}
 <script>
 const DATA = JSON.parse(document.getElementById('data').textContent);
 const ACCOUNTS = DATA.accounts, TX = DATA.tx;
+const HOLDINGS = DATA.holdings || [], OVERRIDES = DATA.overrides || {};
 const XFER = new Set(["LOAN_PAYMENTS","TRANSFER_IN","TRANSFER_OUT"]);
-const LABEL = {TRAVEL:"Travel",GENERAL_SERVICES:"General services",GENERAL_MERCHANDISE:"General merchandise",
+const LABEL = {TRAVEL:"Travel",GENERAL_SERVICES:"Services",GENERAL_MERCHANDISE:"Shopping",
   INCOME:"Income",LOAN_PAYMENTS:"Card payment",TRANSFER_IN:"Transfer in",TRANSFER_OUT:"Transfer out",
-  FOOD_AND_DRINK:"Food and drink",TRANSPORTATION:"Transportation",ENTERTAINMENT:"Entertainment",
-  RENT_AND_UTILITIES:"Rent and utilities",MEDICAL:"Medical",PERSONAL_CARE:"Personal care",OTHER:"Other"};
+  FOOD_AND_DRINK:"Food & drink",TRANSPORTATION:"Transport",ENTERTAINMENT:"Entertainment",
+  RENT_AND_UTILITIES:"Bills & utilities",MEDICAL:"Medical",PERSONAL_CARE:"Personal care",
+  BANK_FEES:"Bank fees",HOME_IMPROVEMENT:"Home",GOVERNMENT_AND_NON_PROFIT:"Government",OTHER:"Other"};
+// Eight validated hues on the dark surface, worst adjacent CVD dE 8.4.
+// Every pill also carries its label, so colour is never the only cue.
+const CAT_COLOR = {
+  TRAVEL:"#3987e5", FOOD_AND_DRINK:"#d95926", TRANSPORTATION:"#199e70",
+  GENERAL_SERVICES:"#c98500", RENT_AND_UTILITIES:"#d55181", MEDICAL:"#008300",
+  GENERAL_MERCHANDISE:"#9085e9", ENTERTAINMENT:"#e66767",
+  PERSONAL_CARE:"#d55181", HOME_IMPROVEMENT:"#9085e9", BANK_FEES:"#e66767",
+  GOVERNMENT_AND_NON_PROFIT:"#199e70", INCOME:"#0ca30c",
+  LOAN_PAYMENTS:"#898781", TRANSFER_IN:"#898781", TRANSFER_OUT:"#898781", OTHER:"#898781"
+};
+const catColor = c => CAT_COLOR[c] || "#898781";
+const CATS = ["INCOME","TRANSFER_IN","TRANSFER_OUT","LOAN_PAYMENTS","BANK_FEES","ENTERTAINMENT",
+  "FOOD_AND_DRINK","GENERAL_MERCHANDISE","HOME_IMPROVEMENT","MEDICAL","PERSONAL_CARE",
+  "GENERAL_SERVICES","GOVERNMENT_AND_NON_PROFIT","TRANSPORTATION","TRAVEL","RENT_AND_UTILITIES"];
 const RAMP=["var(--s500)","var(--s450)","var(--s400)","var(--s350)","var(--s300)"];
 const byId=Object.fromEntries(ACCOUNTS.map(a=>[a.id,a]));
 const money=n=>n.toLocaleString("en-US",{minimumFractionDigits:2,maximumFractionDigits:2});
 const money0=n=>"$"+Math.round(n).toLocaleString("en-US");
 const esc=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
-let state={account:null,category:null};
+const pill=c=>'<span class="pill" style="--c:'+catColor(c)+'"><i></i>'+esc(LABEL[c]||c)+'</span>';
+let state={account:null,category:null,merchant:null};
 
-
-const matches=(t,f)=>(!f.account||t.account===f.account)&&(!f.category||t.category===f.category);
+const matches=(t,f)=>(!f.account||t.account===f.account)&&(!f.category||t.category===f.category)&&
+  (!f.merchant||t.name===f.merchant);
 const acctHasCat=(id,cat)=>!cat||TX.some(t=>t.account===id&&t.category===cat);
+
 function spendByCategory(acct){
   const m={};
   for(const t of TX){
@@ -925,6 +1056,44 @@ function spendByCategory(acct){
     (m[t.category]=m[t.category]||{spent:0,n:0}).spent+=-t.amount; m[t.category].n++;
   }
   return Object.entries(m).map(([cat,v])=>({cat,...v})).sort((a,b)=>b.spent-a.spent);
+}
+function recurring(){
+  const byName={};
+  for(const t of TX){ if(XFER.has(t.category)||t.amount>=0) continue;
+    (byName[t.name]=byName[t.name]||[]).push(t); }
+  const out=[];
+  for(const [name,list] of Object.entries(byName)){
+    if(list.length<2) continue;
+    const amts=list.map(t=>-t.amount).sort((a,b)=>a-b);
+    const med=amts[Math.floor(amts.length/2)];
+    if(med<=0) continue;
+    const close=list.filter(t=>Math.abs(-t.amount-med)/med<=0.15);
+    if(close.length<2) continue;
+    const dates=close.map(t=>new Date(t.date+"T00:00:00")).sort((a,b)=>a-b);
+    let gaps=[]; for(let i=1;i<dates.length;i++) gaps.push((dates[i]-dates[i-1])/86400000);
+    const avgGap=gaps.length?gaps.reduce((a,b)=>a+b,0)/gaps.length:0;
+    out.push({name,n:close.length,amount:med,avgGap,cat:close[0].category,
+      last:dates[dates.length-1].toISOString().slice(0,10),monthly:avgGap>=24&&avgGap<=35});
+  }
+  return out.sort((a,b)=>b.amount*b.n-a.amount*a.n);
+}
+function topMerchants(f){
+  const m={};
+  for(const t of TX){
+    if(XFER.has(t.category)||t.amount>=0) continue;
+    if(f.account&&t.account!==f.account) continue;
+    if(f.category&&t.category!==f.category) continue;
+    (m[t.name]=m[t.name]||{spent:0,n:0,cat:t.category}).spent+=-t.amount; m[t.name].n++;
+  }
+  return Object.entries(m).map(([name,v])=>({name,...v})).sort((a,b)=>b.spent-a.spent).slice(0,6);
+}
+function dayLabel(d){
+  const today=new Date(); today.setHours(0,0,0,0);
+  const dt=new Date(d+"T00:00:00");
+  const diff=Math.round((today-dt)/86400000);
+  if(diff===0) return "Today";
+  if(diff===1) return "Yesterday";
+  return dt.toLocaleDateString("en-GB",{weekday:"short",day:"numeric",month:"long"});
 }
 
 function render(){
@@ -938,105 +1107,158 @@ function render(){
     (DATA.lastSync?" · synced "+DATA.lastSync.slice(0,16).replace("T"," "):"");
 
   document.getElementById("hero").textContent="$"+money(A-L);
-  document.getElementById("gross").textContent=money0(A+L)+" gross";
   const tot=(A+L)||1;
   document.getElementById("splitbar").innerHTML=
     '<div class="split-seg a" style="width:'+(A/tot*100).toFixed(1)+'%"></div>'+
     '<div class="split-seg d" style="width:'+(L/tot*100).toFixed(1)+'%"></div>';
   document.getElementById("splitlegend").innerHTML=
-    '<span><i class="dot a"></i>Assets <b class="legend-val">'+money0(A)+'</b></span>'+
-    '<span><i class="dot d"></i>Card debt <b class="legend-val">'+money0(L)+'</b></span>';
+    '<span><i class="dot a"></i>Assets '+money0(A)+'</span>'+
+    '<span><i class="dot d"></i>Debt '+money0(L)+'</span>';
 
   const shown=TX.filter(t=>matches(t,state));
   const buys=shown.filter(t=>!XFER.has(t.category)&&t.amount<0);
   const spend=buys.reduce((s,t)=>s-t.amount,0);
   const cash=assets.filter(a=>a.type!=="brokerage").reduce((s,a)=>s+a.bal,0);
   const invest=assets.filter(a=>a.type==="brokerage").reduce((s,a)=>s+a.bal,0);
-  // Only cards with a real limit can be measured. Falling back to the balance
-  // would invent a denominator and quietly understate utilisation.
   const known=cards.filter(a=>a.limit!=null&&a.limit>0);
   const noLimit=cards.filter(a=>!(a.limit!=null&&a.limit>0));
   const knownLimit=known.reduce((s,a)=>s+a.limit,0);
   const knownDebt=known.reduce((s,a)=>s+a.bal,0);
   const hiddenDebt=noLimit.reduce((s,a)=>s+a.bal,0);
   const util=knownLimit?knownDebt/knownLimit*100:null;
-  const on=state.account||state.category;
+  const on=state.account||state.category||state.merchant;
+  const pend=buys.filter(t=>t.pending).length;
 
   document.getElementById("kpis").innerHTML=
     '<div class="kpi"><div class="k">Cash &amp; savings</div><div class="v">'+money0(cash)+
-      '</div><div class="d">'+assets.filter(a=>a.type!=="brokerage").length+' deposit accounts</div></div>'+
+      '</div><div class="d">'+assets.filter(a=>a.type!=="brokerage").length+' accounts</div></div>'+
     '<div class="kpi"><div class="k">Investments</div><div class="v">'+money0(invest)+
-      '</div><div class="d">'+(assets.filter(a=>a.type==="brokerage").length||0)+' brokerage</div></div>'+
+      '</div><div class="d">'+(HOLDINGS.length?HOLDINGS.length+" positions":"1 brokerage")+'</div></div>'+
     '<div class="kpi"><div class="k">'+(on?"Spend · filtered":"Real spend")+'</div><div class="v">'+money0(spend)+
-      '</div><div class="d">'+buys.length+' purchase'+(buys.length===1?"":"s")+', transfers excluded'+
-      (buys.filter(t=>t.pending).length?'<br>includes '+buys.filter(t=>t.pending).length+' still pending':"")+
-      '</div></div>'+
-    '<div class="kpi"><div class="k">Credit utilisation</div><div class="v">'+
-      (util==null?"—":util.toFixed(1)+"%")+'</div><div class="d'+(hiddenDebt>0?"":" good")+'">'+
-      (util==null
-        ? 'No limits known yet'
-        : money0(knownDebt)+' of '+money0(knownLimit))+
-      (hiddenDebt>0
-        ? '<br>'+money0(hiddenDebt)+' excluded, '+noLimit.length+' card'+(noLimit.length===1?"":"s")+' with no limit'
-        : "")+'</div></div>';
+      '</div><div class="d">'+buys.length+' purchases'+(pend?', '+pend+' pending':'')+'</div></div>'+
+    '<div class="kpi"><div class="k">Credit used</div><div class="v">'+(util==null?"—":util.toFixed(1)+"%")+
+      '</div><div class="d'+(hiddenDebt>0?"":" good")+'">'+
+      (util==null?'No limits known':money0(knownDebt)+' of '+money0(knownLimit))+
+      (hiddenDebt>0?'<br>'+money0(hiddenDebt)+' excluded':"")+'</div></div>';
 
   const maxA=Math.max(...assets.map(a=>a.bal),0);
-  document.getElementById("capAssets").textContent="Asset accounts by balance. Click one to filter everything below.";
+  document.getElementById("capAssets").textContent="Click one to filter.";
   document.getElementById("assets").innerHTML=assets.length?assets.map((a,i)=>{
     const sel=state.account===a.id, dim=!sel&&!acctHasCat(a.id,state.category);
     return '<div class="row '+(sel?"sel":"")+' '+(dim?"dim":"")+'" data-acct="'+esc(a.id)+'">'+
-      '<div class="row-top"><span class="row-name">'+esc(a.name)+' <span style="color:var(--muted)">· '+esc(a.src)+
-      '</span></span><span class="row-val">$'+money(a.bal)+'</span></div>'+
+      '<div class="row-top"><span class="row-name">'+esc(a.name)+'</span>'+
+      '<span class="row-val">'+money0(a.bal)+'</span></div>'+
       (a.bal>0?'<div class="track"><div class="fill" style="width:'+(maxA?a.bal/maxA*100:0).toFixed(1)+
         '%;background:'+RAMP[Math.min(i,4)]+'"></div></div>':'<div class="meta">Empty</div>')+'</div>';
   }).join(""):'<div class="empty">Nothing linked yet.</div>';
 
-  const cats=spendByCategory(state.account), maxC=cats.length?cats[0].spent:0;
-  document.getElementById("capCat").textContent=state.account
-    ? "Spending inside "+byId[state.account].name+". Transfers excluded."
-    : "Card payments and internal transfers excluded. Click a category to filter.";
-  document.getElementById("cats").innerHTML=cats.length?cats.map((c,i)=>{
-    const sel=state.category===c.cat;
-    return '<div class="row '+(sel?"sel":"")+'" data-cat="'+esc(c.cat)+'">'+
-      '<div class="row-top"><span class="row-name">'+esc(LABEL[c.cat]||c.cat)+' <span style="color:var(--muted)">· '+
-      c.n+' transaction'+(c.n===1?"":"s")+'</span></span><span class="row-val">$'+money(c.spent)+'</span></div>'+
-      '<div class="track"><div class="fill" style="width:'+(c.spent/maxC*100).toFixed(1)+
-      '%;background:'+RAMP[Math.min(i,4)]+'"></div></div></div>';
-  }).join(""):'<div class="empty">No spending in this selection.</div>';
-
-  document.getElementById("capCards").textContent="Balance owed against the limit, where the issuer reports one.";
+  document.getElementById("capCards").textContent="Balance against limit.";
   document.getElementById("cards").innerHTML=cards.length?cards.map(a=>{
     const sel=state.account===a.id, dim=!sel&&!acctHasCat(a.id,state.category);
-    const util=a.limit?a.bal/a.limit*100:null;
-    const meta='<div class="meta">'+
-      (a.limit?(a.bal===0?"Paid off":util.toFixed(1)+"% utilised"):"Limit not reported by issuer")+
-      (a.manual?'<span class="badge">manual</span>':"")+'</div>';
+    const u=a.limit?a.bal/a.limit*100:null;
     return '<div class="row '+(sel?"sel":"")+' '+(dim?"dim":"")+'" data-acct="'+esc(a.id)+'">'+
-      '<div class="row-top"><span class="row-name">'+esc(a.name)+' <span style="color:var(--muted)">· '+esc(a.src)+
-      '</span></span><span class="row-val">$'+money(a.bal)+
-      (a.limit?' <span style="color:var(--muted);font-weight:400">of '+money0(a.limit)+'</span>':"")+'</span></div>'+
-      '<div class="track">'+(a.bal>0&&a.limit?'<div class="fill" style="width:'+Math.max(util,0.4).toFixed(2)+
-        '%;background:var(--debt)"></div>':"")+'</div>'+meta+'</div>';
-  }).join(""):'<div class="empty">No cards linked.</div>';
+      '<div class="row-top"><span class="row-name">'+esc(a.name)+'</span>'+
+      '<span class="row-val">'+money0(a.bal)+'</span></div>'+
+      '<div class="track">'+(a.bal>0&&a.limit?'<div class="fill" style="width:'+Math.max(u,0.6).toFixed(2)+
+        '%;background:var(--debt)"></div>':"")+'</div>'+
+      '<div class="meta">'+(a.limit?(a.bal===0?"Paid off":u.toFixed(1)+"% of "+money0(a.limit)):"No limit reported")+
+      (a.manual?'<span class="badge">manual</span>':"")+'</div></div>';
+  }).join(""):'<div class="empty">No cards.</div>';
+
+  const cats=spendByCategory(state.account), maxC=cats.length?cats[0].spent:0;
+  document.getElementById("capCat").textContent=state.account
+    ? "Inside "+byId[state.account].name+"." : "Transfers excluded. Click to filter.";
+  document.getElementById("cats").innerHTML=cats.length?cats.slice(0,6).map(c=>{
+    const sel=state.category===c.cat;
+    return '<div class="row '+(sel?"sel":"")+'" data-cat="'+esc(c.cat)+'">'+
+      '<div class="row-top"><span class="row-name">'+pill(c.cat)+'</span>'+
+      '<span class="row-val">'+money0(c.spent)+'</span></div>'+
+      '<div class="track"><div class="fill" style="width:'+(c.spent/maxC*100).toFixed(1)+
+      '%;background:'+catColor(c.cat)+'"></div></div></div>';
+  }).join(""):'<div class="empty">No spending here.</div>';
+
+  const merch=topMerchants(state), maxM=merch.length?merch[0].spent:0;
+  document.getElementById("capMerch").textContent=
+    state.category?("Inside "+(LABEL[state.category]||state.category)+"."):"Click one to filter.";
+  document.getElementById("merch").innerHTML=merch.length?merch.map(m=>{
+    const sel=state.merchant===m.name;
+    return '<div class="row '+(sel?"sel":"")+'" data-merch="'+esc(m.name)+'">'+
+      '<div class="row-top"><span class="row-name">'+esc(m.name)+'</span>'+
+      '<span class="row-val">'+money0(m.spent)+'</span></div>'+
+      '<div class="track"><div class="fill" style="width:'+(m.spent/maxM*100).toFixed(1)+
+      '%;background:'+catColor(m.cat)+'"></div></div>'+
+      '<div class="meta">'+m.n+'x</div></div>';
+  }).join(""):'<div class="empty">No spending here.</div>';
+  document.getElementById("clearMerch").classList.toggle("on",!!state.merchant);
+
+  const holdCard=document.getElementById("holdCard");
+  const brokers=ACCOUNTS.filter(a=>a.type==="brokerage");
+  if(!HOLDINGS.length){
+    // Hiding the panel outright looks like the feature is missing. Say what is
+    // wrong instead: the balance is known, the positions behind it are not.
+    if(!brokers.length){ holdCard.style.display="none"; }
+    else{
+      holdCard.style.display="";
+      document.getElementById("capHold").textContent=
+        money0(brokers.reduce((s,a)=>s+a.bal,0))+" across "+brokers.length+
+        (brokers.length===1?" account":" accounts")+", positions not shared yet";
+      document.getElementById("holds").innerHTML='<div class="empty">'+
+        'Positions need investments access, which the bank grants separately. '+
+        'Open <a href="/link">Link a bank</a>, press Add investments on '+esc(brokers[0].name)+
+        ', then Sync now.</div>';
+    }
+  }
+  else{
+    holdCard.style.display="";
+    const total=HOLDINGS.reduce((s,h)=>s+h.value,0);
+    const cost=HOLDINGS.reduce((s,h)=>s+(h.cost!=null?h.cost:0),0);
+    const gain=cost>0?total-cost:null;
+    document.getElementById("capHold").textContent=HOLDINGS.length+" positions"+
+      (gain!=null?(gain>=0?", up ":", down ")+money0(Math.abs(gain)):"");
+    const maxH=HOLDINGS[0]?HOLDINGS[0].value:0;
+    document.getElementById("holds").innerHTML=HOLDINGS.slice(0,6).map((h,i)=>{
+      const pct=total?h.value/total*100:0;
+      const g=(h.cost!=null&&h.cost>0)?h.value-h.cost:null;
+      return '<div class="row" style="cursor:default">'+
+        '<div class="row-top"><span class="row-name">'+esc(h.ticker||h.name)+
+        (h.ticker?'<span class="hold-t">'+esc(h.name)+'</span>':"")+'</span>'+
+        '<span class="row-val">'+money0(h.value)+'</span></div>'+
+        '<div class="track"><div class="fill" style="width:'+(maxH?h.value/maxH*100:0).toFixed(1)+
+        '%;background:'+RAMP[Math.min(i,4)]+'"></div></div>'+
+        '<div class="meta">'+pct.toFixed(1)+'%'+
+        (g!=null?' <span class="'+(g>=0?"gain":"loss")+'">'+(g>=0?"+":"−")+money0(Math.abs(g))+'</span>':"")+
+        '</div></div>';
+    }).join("");
+  }
+
+  const rec=recurring();
+  const spanDays=(()=>{ if(!TX.length) return 0;
+    const ds=TX.map(t=>new Date(t.date+"T00:00:00")); return (Math.max(...ds)-Math.min(...ds))/86400000; })();
+  document.getElementById("capRecur").textContent=rec.length
+    ? money0(rec.filter(r=>r.monthly).reduce((s,r)=>s+r.amount,0))+" a month"
+    : (spanDays<70 ? "Needs a few months. "+Math.round(spanDays)+" days so far." : "Nothing repeating.");
+  document.getElementById("recur").innerHTML=rec.length?rec.slice(0,6).map(r=>
+    '<div class="row" data-merch="'+esc(r.name)+'">'+
+    '<div class="row-top"><span class="row-name">'+esc(r.name)+'</span>'+
+    '<span class="row-val">'+money0(r.amount)+'</span></div>'+
+    '<div class="meta">'+r.n+'x'+(r.monthly?' · monthly':' · every '+Math.round(r.avgGap)+'d')+'</div></div>').join("")
+    :'<div class="empty">None detected.</div>';
 
   document.getElementById("capTx").textContent=on
-    ? shown.length+" of "+TX.length+" transactions match the current filters."
-    : "Transfers between your own accounts are dimmed and tagged.";
-  document.getElementById("txwrap").innerHTML=shown.length?
-    '<table><thead><tr><th>Date</th><th>Transaction</th><th>Account</th><th>Category</th>'+
-    '<th style="text-align:right">Amount</th></tr></thead><tbody>'+
-    shown.slice(0,200).map(t=>{
-      const a=byId[t.account], x=XFER.has(t.category);
-      const d=new Date(t.date+"T00:00:00").toLocaleDateString("en-GB",{day:"numeric",month:"short"});
-      const an=esc(a?a.name:"—"), cn=esc(LABEL[t.category]||t.category);
-      return '<tr class="'+(x?"xfer":"")+'"><td>'+d+'</td><td class="name">'+esc(t.name)+
-        (x?'<span class="tag">transfer</span>':"")+
-        (t.pending?'<span class="tag pend">pending</span>':"")+
-        '<span class="sub-meta">'+an+' · '+cn+'</span></td><td>'+an+'</td><td>'+cn+
-        '</td><td class="num '+(t.amount<0?"neg":"pos")+'">'+
-        (t.amount<0?"−":"+")+money(Math.abs(t.amount))+'</td></tr>';
-    }).join("")+'</tbody></table>'
-    :'<div class="empty">No transactions match these filters.</div>';
+    ? shown.length+" of "+TX.length+" match." : TX.length+" transactions. Transfers dimmed.";
+  let html="", lastDay="";
+  for(const t of shown.slice(0,300)){
+    if(t.date!==lastDay){ lastDay=t.date; html+='<div class="tx-day">'+esc(dayLabel(t.date))+'</div>'; }
+    const a=byId[t.account], x=XFER.has(t.category);
+    html+='<div class="tx-row '+(x?"xfer":"")+'">'+
+      '<div class="tx-main"><div class="tx-name">'+esc(t.name)+
+      (t.pending?'<span class="tag pend">pending</span>':"")+
+      (x?'<span class="tag">transfer</span>':"")+'</div>'+
+      '<div class="tx-sub">'+esc(a?a.name:"—")+'</div></div>'+
+      pill(t.category)+
+      '<div class="tx-amt '+(t.amount<0?"neg":"pos")+'">'+(t.amount<0?"−":"+")+money(Math.abs(t.amount))+'</div></div>';
+  }
+  document.getElementById("txwrap").innerHTML=shown.length?html:'<div class="empty">Nothing matches.</div>';
 
   document.getElementById("clearAssets").classList.toggle("on",!!state.account&&byId[state.account].type!=="credit card");
   document.getElementById("clearCards").classList.toggle("on",!!state.account&&byId[state.account].type==="credit card");
@@ -1044,79 +1266,113 @@ function render(){
   document.getElementById("clearTx").classList.toggle("on",!!on);
 
   const chips=[];
-  if(state.account) chips.push('<span class="chip"><span style="color:var(--muted);font-size:11px">Account</span> '+
-    esc(byId[state.account].name)+'<button data-clear="account">×</button></span>');
-  if(state.category) chips.push('<span class="chip"><span style="color:var(--muted);font-size:11px">Category</span> '+
-    esc(LABEL[state.category]||state.category)+'<button data-clear="category">×</button></span>');
+  if(state.account) chips.push('<span class="chip">'+esc(byId[state.account].name)+'<button data-clear="account">×</button></span>');
+  if(state.category) chips.push('<span class="chip">'+esc(LABEL[state.category]||state.category)+'<button data-clear="category">×</button></span>');
+  if(state.merchant) chips.push('<span class="chip">'+esc(state.merchant)+'<button data-clear="merchant">×</button></span>');
   document.getElementById("filterbar").innerHTML=chips.length
     ? chips.join("")+'<button data-clear="all">Clear all</button>'
     : '<span>No filters. Click any row to filter.</span>';
 }
 
+/* ---- credit limits modal ---- */
 const limModal=document.getElementById("limmodal");
-
 function openLimits(){
   const cards=ACCOUNTS.filter(a=>a.type==="credit card");
-  document.getElementById("limrows").innerHTML = cards.length ? cards.map(a=>{
-    const src = a.manual ? "your figure"
-      : a.reported!=null ? "reported by "+esc(a.src)
-      : "not reported by "+esc(a.src);
+  document.getElementById("limrows").innerHTML=cards.length?cards.map(a=>{
+    const src=a.manual?"your figure":a.reported!=null?"reported by "+esc(a.src):"not reported by "+esc(a.src);
     return '<div class="limrow"><div class="who"><div class="nm">'+esc(a.name)+'</div>'+
       '<div class="sb">$'+money(a.bal)+' owed · '+src+'</div></div>'+
-      '<input type="number" min="1" step="100" placeholder="No limit" '+
-      'value="'+(a.limit!=null?a.limit:"")+'" data-lim="'+esc(a.id)+'"></div>';
-  }).join("") : '<div class="empty">No cards linked.</div>';
+      '<input type="number" min="1" step="100" placeholder="No limit" value="'+(a.limit!=null?a.limit:"")+
+      '" data-lim="'+esc(a.id)+'"></div>';
+  }).join(""):'<div class="empty">No cards linked.</div>';
   document.getElementById("limstatus").textContent="";
   limModal.hidden=false;
   const f=limModal.querySelector("input"); if(f){f.focus();f.select();}
 }
 function closeLimits(){ limModal.hidden=true; }
-
 async function saveLimits(){
-  const inputs=[...limModal.querySelectorAll("[data-lim]")];
   const changed=[];
-  for(const i of inputs){
-    const a=byId[i.dataset.lim];
-    const raw=i.value.trim();
-    const next = raw==="" ? null : Number(raw);
-    const now  = a.limit!=null ? Number(a.limit) : null;
-    if(next!==now) changed.push({a, next});
+  for(const i of [...limModal.querySelectorAll("[data-lim]")]){
+    const a=byId[i.dataset.lim], raw=i.value.trim();
+    const next=raw===""?null:Number(raw), now=a.limit!=null?Number(a.limit):null;
+    if(next!==now) changed.push({a,next});
   }
   if(!changed.length){ closeLimits(); return; }
-
-  const status=document.getElementById("limstatus");
-  status.textContent="Saving...";
+  const status=document.getElementById("limstatus"); status.textContent="Saving...";
   for(const {a,next} of changed){
     const res=await fetch("/api/limit",{method:"POST",headers:{"content-type":"application/json"},
-      body:JSON.stringify({account_id:a.id, limit:next})});
+      body:JSON.stringify({account_id:a.id,limit:next})});
     const body=await res.json().catch(()=>({}));
     if(!res.ok){ status.textContent="Failed on "+a.name+": "+(body.error||res.status); return; }
-    a.manual = next!==null;
-    // clearing hands the card back to whatever the issuer reports
-    a.limit  = next!==null ? next : (a.reported!=null ? a.reported : null);
+    a.manual=next!==null;
+    a.limit=next!==null?next:(a.reported!=null?a.reported:null);
   }
   closeLimits(); render();
 }
 
+/* ---- categories modal ---- */
+const catModal=document.getElementById("catmodal");
+function openCats(){
+  const m={};
+  for(const t of TX){ if(t.amount<0) (m[t.name]=m[t.name]||{spent:0,cat:t.category}).spent+=-t.amount; }
+  const list=Object.entries(m).map(([name,v])=>({name,...v})).sort((a,b)=>b.spent-a.spent).slice(0,40);
+  document.getElementById("catrows").innerHTML=list.length?list.map(x=>{
+    const cur=OVERRIDES[x.name]||"";
+    return '<div class="limrow"><div class="who"><div class="nm">'+esc(x.name)+'</div>'+
+      '<div class="sb">'+money(x.spent)+' · now '+esc(LABEL[x.cat]||x.cat)+(cur?' · set by you':"")+'</div></div>'+
+      '<select data-cat-for="'+esc(x.name)+'"><option value="">Automatic</option>'+
+      CATS.map(c=>'<option value="'+c+'"'+(cur===c?" selected":"")+'>'+(LABEL[c]||c)+'</option>').join("")+
+      '</select></div>';
+  }).join(""):'<div class="empty">No spending yet.</div>';
+  document.getElementById("catstatus").textContent="";
+  catModal.hidden=false;
+}
+function closeCats(){ catModal.hidden=true; }
+async function saveCats(){
+  const sels=[...catModal.querySelectorAll("[data-cat-for]")];
+  const changed=sels.filter(s=>(OVERRIDES[s.dataset.catFor]||"")!==s.value);
+  if(!changed.length){ closeCats(); return; }
+  const status=document.getElementById("catstatus"); status.textContent="Saving...";
+  for(const s of changed){
+    const merchant=s.dataset.catFor;
+    const res=await fetch("/api/category",{method:"POST",headers:{"content-type":"application/json"},
+      body:JSON.stringify({merchant,category:s.value||null})});
+    if(!res.ok){ const b=await res.json().catch(()=>({}));
+      status.textContent="Failed on "+merchant+": "+(b.error||res.status); return; }
+    if(s.value){ OVERRIDES[merchant]=s.value; TX.forEach(t=>{ if(t.name===merchant) t.category=s.value; }); }
+    else delete OVERRIDES[merchant];
+  }
+  closeCats(); state.category=null; render();
+}
+
+/* ---- events ---- */
+document.addEventListener("click",e=>{
+  const c=e.target.closest("[data-clear]");
+  if(c){ const w=c.dataset.clear;
+    if(w==="all") state={account:null,category:null,merchant:null}; else state[w]=null;
+    return render(); }
+  const r=e.target.closest("[data-acct],[data-cat],[data-merch]");
+  if(r){
+    if(r.dataset.acct) state.account=state.account===r.dataset.acct?null:r.dataset.acct;
+    else if(r.dataset.merch) state.merchant=state.merchant===r.dataset.merch?null:r.dataset.merch;
+    else state.category=state.category===r.dataset.cat?null:r.dataset.cat;
+    return render();
+  }
+});
+document.addEventListener("keydown",e=>{
+  if(e.key==="Escape"){
+    if(!limModal.hidden) closeLimits();
+    if(!catModal.hidden) closeCats();
+  }
+});
 document.getElementById("limits").onclick=openLimits;
 document.getElementById("limcancel").onclick=closeLimits;
 document.getElementById("limsave").onclick=saveLimits;
 limModal.addEventListener("click",e=>{ if(e.target===limModal) closeLimits(); });
-
-document.addEventListener("click",e=>{
-  const c=e.target.closest("[data-clear]");
-  if(c){ const w=c.dataset.clear; if(w==="all") state={account:null,category:null}; else state[w]=null; return render(); }
-  const r=e.target.closest("[data-acct],[data-cat]");
-  if(r){
-    if(r.dataset.acct) state.account = state.account===r.dataset.acct ? null : r.dataset.acct;
-    else state.category = state.category===r.dataset.cat ? null : r.dataset.cat;
-    return render();
-  }
-});
-
-document.addEventListener("keydown",e=>{
-  if(e.key==="Escape" && !document.getElementById("limmodal").hidden) closeLimits();
-});
+document.getElementById("cats-btn").onclick=openCats;
+document.getElementById("catcancel").onclick=closeCats;
+document.getElementById("catsave").onclick=saveCats;
+catModal.addEventListener("click",e=>{ if(e.target===catModal) closeCats(); });
 
 const tb=document.getElementById("theme");
 tb.onclick=()=>{ const light=document.documentElement.getAttribute("data-theme")==="light";
@@ -1129,9 +1385,10 @@ document.getElementById("sync").onclick=async e=>{
     const res=await fetch("/sync/run",{method:"POST"});
     const body=await res.json();
     if(!res.ok) throw new Error(body.error||res.status);
-    let msg=body.accounts+" accounts, "+body.transactions+" transactions.";
-    if(body.errors&&body.errors.length) msg+=" Errors: "+body.errors.join("; ");
-    st.textContent=msg+" Reloading...";
+    let msg=body.accounts+" accounts, "+body.transactions+" tx";
+    if(body.holdings) msg+=", "+body.holdings+" holdings";
+    if(body.errors&&body.errors.length) msg+=" · "+body.errors.join("; ");
+    st.textContent=msg+". Reloading...";
     setTimeout(()=>location.reload(),1200);
   }catch(err){ st.textContent="Failed: "+err.message; btn.disabled=false; }
 };
@@ -1251,8 +1508,14 @@ export default {
             .bind(body.item_id).first();
           if (!row) return json({ error: "Unknown item" }, 404);
           params.access_token = row.access_token;
+          // Adding a product to an Item already linked. The bank asks for the
+          // extra consent, the access_token still does not change.
+          if (body.investments) params.products = ["investments"];
         } else {
           params.products = ["transactions"];
+          // Consented now, fetched later. Institutions without investments
+          // ignore it, so this is safe to send every time.
+          params.additional_consented_products = ["investments"];
         }
 
         const r = await plaid(env, "/link/token/create", params);
@@ -1296,6 +1559,23 @@ export default {
       } catch (err) {
         return json({ error: err.message }, 502);
       }
+    }
+
+    if (path === "/api/category" && request.method === "POST") {
+      if (!session) return json({ error: "Not signed in" }, 401);
+      const body = await request.json().catch(() => ({}));
+      const merchant = String(body.merchant || "").trim();
+      if (!merchant) return json({ error: "Missing merchant" }, 400);
+      const category = body.category ? String(body.category) : null;
+      if (category) {
+        await env.DB.prepare(
+          `INSERT INTO category_overrides (merchant, category, updated_at) VALUES (?, ?, ?)
+           ON CONFLICT(merchant) DO UPDATE SET category=excluded.category, updated_at=excluded.updated_at`
+        ).bind(merchant, category, new Date().toISOString()).run();
+      } else {
+        await env.DB.prepare("DELETE FROM category_overrides WHERE merchant = ?").bind(merchant).run();
+      }
+      return json({ ok: true, merchant, category });
     }
 
     if (path === "/api/limit" && request.method === "POST") {
