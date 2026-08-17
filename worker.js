@@ -207,6 +207,7 @@ async function fetchItem(env, item, startDate, endDate) {
 
   const accounts = bal.accounts.map((a) => ({
     id: a.account_id,
+    item_id: item.item_id,
     source: item.institution || "plaid",
     name: a.name || a.official_name || "Account",
     type: a.subtype || a.type || null,
@@ -358,13 +359,13 @@ async function store(env, accounts, transactions) {
 
   for (const a of accounts) {
     stmts.push(env.DB.prepare(
-      `INSERT INTO accounts (id, source, name, type, currency, balance, available, credit_limit, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `INSERT INTO accounts (id, item_id, source, name, type, currency, balance, available, credit_limit, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(id) DO UPDATE SET
-         name=excluded.name, source=excluded.source, balance=excluded.balance,
-         available=excluded.available, credit_limit=excluded.credit_limit,
-         updated_at=excluded.updated_at`
-    ).bind(a.id, a.source, a.name, a.type || null, a.currency, a.balance,
+         item_id=excluded.item_id, name=excluded.name, source=excluded.source,
+         balance=excluded.balance, available=excluded.available,
+         credit_limit=excluded.credit_limit, updated_at=excluded.updated_at`
+    ).bind(a.id, a.item_id ?? null, a.source, a.name, a.type || null, a.currency, a.balance,
            a.available ?? null, a.creditLimit ?? null, now));
   }
 
@@ -510,6 +511,10 @@ button:hover{background:#265fd0}
 button:disabled{opacity:.5;cursor:default}
 button.small{background:#1d2630;border:1px solid #2c3743;padding:4px 10px;font-size:12px}
 button.small:hover{background:#243040}
+button.danger{border-color:#e66767;color:#e66767}
+button.danger:hover{background:rgba(230,103,103,.12);color:#fff}
+td.act{text-align:right;white-space:nowrap}
+.dupe{color:#fab219;font-size:11px}
 #status{margin-top:16px;font-size:13px;color:#8a8f98;white-space:pre-wrap}
 .warn{color:#e0a45e}.ok{color:#6ac48a}
 a{color:#8a8f98;font-size:13px}
@@ -534,17 +539,53 @@ async function loadLinked() {
   const body = await res.json();
   const el = document.getElementById('linked');
   if (!body.items || !body.items.length) { el.innerHTML = ''; return; }
-  el.innerHTML = '<table><thead><tr><th>Linked</th><th>Added</th><th>Status</th></tr></thead><tbody>' +
+  const seen = {};
+  body.items.forEach(i => { seen[i.institution] = (seen[i.institution] || 0) + 1; });
+
+  el.innerHTML = '<table><thead><tr><th>Linked</th><th>Added</th><th>Status</th><th></th></tr></thead><tbody>' +
     body.items.map(i => {
       const broken = i.last_error === 'ITEM_LOGIN_REQUIRED';
       const cell = broken
         ? '<span class="warn">Needs reconnect</span> <button class="small" data-item="' + i.item_id + '">Reconnect</button>'
         : (i.last_error ? '<span class="warn">' + i.last_error + '</span>' : '<span class="ok">OK</span>');
-      return '<tr><td>' + i.institution + '</td><td>' + i.added_at.slice(0,10) + '</td><td>' + cell + '</td></tr>';
-    }).join('') + '</tbody></table>';
+      const dupe = seen[i.institution] > 1 ? ' <span class="dupe">linked ' + seen[i.institution] + 'x</span>' : '';
+      return '<tr><td>' + i.institution + dupe + '</td><td>' + i.added_at.slice(0,10) + '</td><td>' + cell +
+        '</td><td class="act"><button class="small danger" data-rm="' + i.item_id + '">Remove</button></td></tr>';
+    }).join('') + '</tbody></table>' +
+    '<p class="sub" style="margin-top:10px">Removing revokes the connection at Plaid and deletes its accounts and ' +
+    'transactions from your database. On the Plaid Trial plan this does not free a slot.</p>';
 
   el.querySelectorAll('button[data-item]').forEach(b => {
     b.onclick = () => openLink(b.getAttribute('data-item'), b);
+  });
+  // Two-step confirm rather than a browser dialog.
+  el.querySelectorAll('button[data-rm]').forEach(b => {
+    b.onclick = async () => {
+      if (b.dataset.armed !== '1') {
+        el.querySelectorAll('button[data-rm]').forEach(o => {
+          o.dataset.armed = ''; o.textContent = 'Remove';
+        });
+        b.dataset.armed = '1'; b.textContent = 'Confirm?';
+        setTimeout(() => { if (b.dataset.armed === '1') { b.dataset.armed=''; b.textContent='Remove'; } }, 5000);
+        return;
+      }
+      b.disabled = true; b.textContent = 'Removing...';
+      status.textContent = '';
+      try {
+        const res = await fetch('/api/link/remove', {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ item_id: b.getAttribute('data-rm') })
+        });
+        const r = await res.json();
+        if (!res.ok) throw new Error(r.error || res.status);
+        status.textContent = 'Removed ' + r.institution + ', ' + r.accounts + ' account(s) deleted' +
+          (r.revoked ? '.' : '. Plaid revoke failed, remove it from your Plaid dashboard too.');
+        loadLinked();
+      } catch (err) {
+        status.textContent = 'Failed: ' + err.message;
+        b.disabled = false; b.textContent = 'Remove';
+      }
+    };
   });
 }
 loadLinked();
@@ -1273,6 +1314,50 @@ export default {
         .bind(value, id).run();
       if (!res.meta || res.meta.changes === 0) return json({ error: "Unknown account" }, 404);
       return json({ ok: true, limit: value });
+    }
+
+    // Unlink a connection: revoke it at Plaid, then delete its local rows.
+    if (path === "/api/link/remove" && request.method === "POST") {
+      if (!session) return json({ error: "Not signed in" }, 401);
+      const body = await request.json().catch(() => ({}));
+      const itemId = String(body.item_id || "");
+      if (!itemId) return json({ error: "Missing item_id" }, 400);
+
+      const row = await env.DB.prepare(
+        "SELECT access_token, institution FROM plaid_items WHERE item_id = ?"
+      ).bind(itemId).first();
+      if (!row) return json({ error: "Unknown connection" }, 404);
+
+      // Which accounts belong to this connection. Ask Plaid first, since rows
+      // stored before item_id existed carry no link. Fall back to the column
+      // when the token is already dead.
+      let ids = [];
+      try {
+        const bal = await plaid(env, "/accounts/balance/get", { access_token: row.access_token });
+        ids = bal.accounts.map((a) => a.account_id);
+      } catch {
+        const r = await env.DB.prepare("SELECT id FROM accounts WHERE item_id = ?").bind(itemId).all();
+        ids = (r.results || []).map((x) => x.id);
+      }
+
+      // Revoke at Plaid so it stops refreshing. Note this does not free a slot
+      // on the Trial plan.
+      let revoked = true;
+      try {
+        await plaid(env, "/item/remove", { access_token: row.access_token });
+      } catch {
+        revoked = false;
+      }
+
+      for (let i = 0; i < ids.length; i += 40) {
+        const c = ids.slice(i, i + 40);
+        const ph = c.map(() => "?").join(",");
+        await env.DB.prepare(`DELETE FROM transactions WHERE account_id IN (${ph})`).bind(...c).run();
+        await env.DB.prepare(`DELETE FROM accounts WHERE id IN (${ph})`).bind(...c).run();
+      }
+      await env.DB.prepare("DELETE FROM plaid_items WHERE item_id = ?").bind(itemId).run();
+
+      return json({ ok: true, institution: row.institution, accounts: ids.length, revoked });
     }
 
     if (path === "/sync/run" && request.method === "POST") {

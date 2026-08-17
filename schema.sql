@@ -3,13 +3,15 @@
 
 CREATE TABLE IF NOT EXISTS accounts (
   id TEXT PRIMARY KEY,
+  item_id TEXT,                -- the plaid_items row this account came from
   source TEXT NOT NULL,        -- institution name, or 'openfinance'
   name TEXT NOT NULL,
   type TEXT,
   currency TEXT NOT NULL,
   balance REAL NOT NULL,
   available REAL,
-  credit_limit REAL,        -- credit cards: the issuer's reported limit
+  credit_limit REAL,           -- credit cards: the issuer's reported limit
+  manual_limit REAL,           -- credit limit you entered yourself, survives syncs
   updated_at TEXT NOT NULL
 );
 
