@@ -110,6 +110,13 @@ h2{font-size:clamp(24px,3.4vw,34px);line-height:1.2;letter-spacing:-.02em;margin
 .gcard p{margin:0;color:var(--text-dim);font-size:14px}
 .gcard.narrow img{max-width:300px;max-height:520px;object-fit:cover;object-position:top;
   margin:22px auto 0;border:1px solid var(--border);border-radius:10px}
+.gcard.phones{grid-column:1/-1}
+.phones .row{display:flex;gap:18px;justify-content:center;padding:24px 18px 4px}
+.phones .row img{width:250px;height:auto;max-width:calc((100% - 36px) / 3);border:1px solid var(--border);border-radius:16px}
+@media(max-width:620px){
+  .phones .row{justify-content:flex-start;overflow-x:auto;scroll-snap-type:x mandatory;-webkit-overflow-scrolling:touch}
+  .phones .row img{flex:none;width:72%;max-width:none;scroll-snap-align:center}
+}
 
 .honest{display:grid;grid-template-columns:1fr 1fr;gap:16px}
 @media(max-width:820px){.honest{grid-template-columns:1fr}}
@@ -306,11 +313,16 @@ footer{border-top:1px solid var(--border-soft);padding:34px 0 46px;color:var(--t
             figure instead of an invented one.</p>
           </div>
         </div>
-        <div class="gcard narrow">
-          <img src="mobile.png" alt="The same dashboard on a phone, tiles stacked in one column">
+        <div class="gcard phones">
+          <div class="row">
+            <img src="mobile.png" alt="The dashboard on a phone in dark mode, with an app bar and tiles stacked in one column" width="780" height="1688" loading="lazy">
+            <img src="mobile-menu.png" alt="The phone menu open: Link a bank, Sync now, Credit limits, Categories and sign out" width="780" height="1688" loading="lazy">
+            <img src="mobile-light.png" alt="The dashboard on a phone in light mode" width="780" height="1688" loading="lazy">
+          </div>
           <div class="t">
-            <h3>Works on a phone</h3>
-            <p>The three columns collapse to one. Same data, same filters, no separate app to install.</p>
+            <h3>Built for a phone too</h3>
+            <p>An app bar with a menu for the actions and a light/dark switch that remembers your choice.
+            Tap targets sized for a thumb, text you read without zooming. Same data, same filters, no app to install.</p>
           </div>
         </div>
       </div>

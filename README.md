@@ -10,7 +10,7 @@ A self-hosted dashboard for your own bank accounts. You deploy your own copy. Yo
 
 One page showing every account you own. Balances, credit cards, spending by category, top merchants, recurring charges, investment holdings, and a transaction list you filter by clicking.
 
-The tiles pack into three columns and the transaction list holds the right third of the screen, scrolling on its own so the tiles stay in place. On a phone everything collapses to one column.
+The tiles pack into three columns and the transaction list holds the right third of the screen, scrolling on its own so the tiles stay in place. On a phone everything stacks into one column under an app-style header, with a menu for the actions and a light/dark switch that remembers your choice.
 
 Everything runs on Cloudflare's free tier. A daily cron job pulls fresh data from your banks through Plaid, writes to a private D1 database, and the dashboard reads from there. Sign-in uses Google, restricted to an email allowlist you control.
 
@@ -41,9 +41,13 @@ Sign-in is restricted to the email addresses you allowlist.
 
 <img src="docs/login.png" alt="Sign in" width="520">
 
-The three columns collapse to one on a phone. Same data, same filters.
+On a phone the three columns stack into one and the header becomes an app bar. The round button switches between light and dark, and the page remembers your choice. The menu holds Link a bank, Sync now, Credit limits and Categories. Tap targets are sized for a thumb and the text reads without zooming. Same data, same filters.
 
-<img src="docs/mobile.png" alt="Mobile layout" width="330">
+<p>
+  <img src="docs/mobile.png" alt="Mobile layout in dark mode" width="250">
+  <img src="docs/mobile-menu.png" alt="Mobile menu open" width="250">
+  <img src="docs/mobile-light.png" alt="Mobile layout in light mode" width="250">
+</p>
 
 ## What you need
 
