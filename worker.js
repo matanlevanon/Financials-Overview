@@ -925,21 +925,52 @@ button:disabled{opacity:.5;cursor:default}
 .limrow input:focus,.limrow select:focus{outline:none;border-color:var(--assets)}
 #limstatus,#catstatus{font-size:11px;color:var(--muted);margin-right:auto;align-self:center}
 html{-webkit-text-size-adjust:100%;text-size-adjust:100%}
+.appbar-actions,.status-m,.controls svg{display:none}
 
 /* Phone layout. Desktop stays dense; under 700px every tap target is at least
    44px tall and body text sits at 14-15px so it reads without zooming. */
 @media(max-width:700px){
   body{font-size:15px;padding:12px max(12px,env(safe-area-inset-right)) 28px max(12px,env(safe-area-inset-left))}
-  header{flex-direction:column;align-items:stretch;gap:10px}
-  h1{font-size:19px}
-  .sub,.who{font-size:13px}
-  .controls{display:grid;grid-template-columns:1fr 1fr;gap:8px}
-  .controls .who,#status,.controls a.btn{grid-column:1/-1}
-  .controls .who{display:flex;justify-content:space-between;align-items:center;order:-1}
-  .who a{padding:8px 0;font-size:14px}
+  body{padding-top:0}
   button,a.btn{font-size:15px;padding:11px 14px;min-height:46px;border-radius:10px;text-align:center}
   a.btn{display:flex;align-items:center;justify-content:center}
-  #status{font-size:13px}
+
+  /* app bar: title left, round icon buttons right, sticks to the top */
+  header{position:sticky;top:0;z-index:60;flex-wrap:nowrap;gap:10px;
+    margin:0 calc(-1 * max(12px,env(safe-area-inset-right))) 12px calc(-1 * max(12px,env(safe-area-inset-left)));
+    padding:max(10px,env(safe-area-inset-top)) max(12px,env(safe-area-inset-right)) 10px max(12px,env(safe-area-inset-left));
+    background:color-mix(in srgb, var(--plane) 88%, transparent);
+    -webkit-backdrop-filter:saturate(1.4) blur(14px);backdrop-filter:saturate(1.4) blur(14px);
+    border-bottom:1px solid var(--grid)}
+  .titles{flex:1;min-width:0}
+  h1{font-size:18px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .sub{font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:2px}
+  .appbar-actions{display:flex;gap:8px;flex:none}
+  .icon-btn{width:42px;height:42px;min-height:42px;padding:0;border-radius:50%;
+    display:grid;place-items:center;color:var(--text-primary)}
+  .icon-btn svg{width:20px;height:20px}
+  .icon-btn[aria-expanded="true"]{background:var(--sel);border-color:var(--sel-line)}
+
+  /* overflow menu */
+  .controls{display:none;position:absolute;top:calc(100% + 6px);right:max(12px,env(safe-area-inset-right));
+    width:min(290px,calc(100vw - 24px));flex-direction:column;align-items:stretch;gap:2px;padding:6px;
+    background:var(--card);border:1px solid var(--border);border-radius:16px;
+    box-shadow:0 12px 32px rgba(0,0,0,.35),0 2px 8px rgba(0,0,0,.2);
+    transform-origin:top right;animation:menu-in .14s ease-out}
+  header.open .controls{display:flex}
+  @keyframes menu-in{from{opacity:0;transform:scale(.96) translateY(-4px)}to{opacity:1;transform:none}}
+  .controls button,.controls a.btn{display:flex;align-items:center;gap:14px;justify-content:flex-start;
+    text-align:left;background:transparent;border:0;border-radius:11px;color:var(--text-primary);
+    font-size:16px;min-height:50px;padding:12px 14px}
+  .controls button:active,.controls a.btn:active{background:var(--sel)}
+  .controls svg{display:block;width:20px;height:20px;flex:none;color:var(--text-secondary)}
+  .controls #theme,.controls #status{display:none}
+  .controls .who{order:10;display:flex;justify-content:space-between;align-items:center;gap:10px;
+    margin-top:4px;padding:10px 14px 6px;border-top:1px solid var(--grid);font-size:13px;min-width:0}
+  .controls .who .em{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .controls .who a{flex:none;font-size:14px;padding:8px 0;color:var(--debt)}
+  .status-m:not([hidden]){display:block;font-size:13px;color:var(--text-secondary);
+    background:var(--card);border:1px solid var(--border);border-radius:11px;padding:10px 12px;margin:-2px 0 12px}
 
   .filterbar{font-size:13px;gap:8px}
   .chip{font-size:14px;padding:6px 6px 6px 12px}
@@ -1003,18 +1034,23 @@ html{-webkit-text-size-adjust:100%;text-size-adjust:100%}
 }
 </style></head>
 <body>
-<header>
-  <div><h1>Finance Overview</h1><div class="sub" id="subtitle"></div></div>
-  <div class="controls">
-    <span class="who">${esc(email)} <a href="/logout">Sign out</a></span>
-    <a class="btn" href="/link">Link a bank</a>
-    <button id="sync">Sync now</button>
-    <button id="limits">Credit limits</button>
-    <button id="cats-btn">Categories</button>
+<header id="appbar">
+  <div class="titles"><h1>Finance Overview</h1><div class="sub" id="subtitle"></div></div>
+  <div class="appbar-actions">
+    <button class="icon-btn" id="theme-ico" aria-label="Switch to light mode"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg></button>
+    <button class="icon-btn" id="menu-btn" aria-label="Menu" aria-haspopup="true" aria-expanded="false" aria-controls="menu"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16"/></svg></button>
+  </div>
+  <div class="controls" id="menu">
+    <span class="who"><span class="em">${esc(email)}</span> <a href="/logout">Sign out</a></span>
+    <a class="btn" href="/link"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 10l9-6 9 6M5 10v8M9.5 10v8M14.5 10v8M19 10v8M3 20h18"/></svg><span>Link a bank</span></a>
+    <button id="sync"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 11a8 8 0 0 0-14.3-4.9L4 8M4 4v4h4M4 13a8 8 0 0 0 14.3 4.9L20 16M20 20v-4h-4"/></svg><span>Sync now</span></button>
+    <button id="limits"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2.5" y="5" width="19" height="14" rx="2.5"/><path d="M2.5 10h19M6 15h4"/></svg><span>Credit limits</span></button>
+    <button id="cats-btn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20.6 13.4l-7.2 7.2a2 2 0 0 1-2.8 0L3 13V3h10l7.6 7.6a2 2 0 0 1 0 2.8z"/><circle cx="7.5" cy="7.5" r="1.5"/></svg><span>Categories</span></button>
     <button id="theme">Light</button>
     <span id="status"></span>
   </div>
 </header>
+<div class="status-m" id="status-m" hidden></div>
 
 <div class="filterbar" id="filterbar"></div>
 
@@ -1463,12 +1499,32 @@ document.getElementById("catcancel").onclick=closeCats;
 document.getElementById("catsave").onclick=saveCats;
 catModal.addEventListener("click",e=>{ if(e.target===catModal) closeCats(); });
 
-const tb=document.getElementById("theme");
+const tb=document.getElementById("theme"), tbi=document.getElementById("theme-ico");
+const ICON_SUN=tbi.innerHTML;
+const ICON_MOON='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>';
 tb.onclick=()=>{ const light=document.documentElement.getAttribute("data-theme")==="light";
-  document.documentElement.setAttribute("data-theme",light?"dark":"light"); tb.textContent=light?"Light":"Dark"; };
+  document.documentElement.setAttribute("data-theme",light?"dark":"light"); tb.textContent=light?"Light":"Dark";
+  // the icon shows the mode a tap switches to
+  tbi.innerHTML=light?ICON_SUN:ICON_MOON;
+  tbi.setAttribute("aria-label", light?"Switch to light mode":"Switch to dark mode"); };
+tbi.onclick=()=>tb.click();
+
+// Phone overflow menu. On desktop the same buttons sit inline and none of this fires.
+const appbar=document.getElementById("appbar"), menuBtn=document.getElementById("menu-btn");
+function setMenu(open){ appbar.classList.toggle("open",open); menuBtn.setAttribute("aria-expanded",String(open)); }
+menuBtn.onclick=e=>{ e.stopPropagation(); setMenu(!appbar.classList.contains("open")); };
+document.addEventListener("click",e=>{
+  if(!appbar.classList.contains("open")) return;
+  if(!e.target.closest("#menu") || e.target.closest("button,a")) setMenu(false);
+});
+document.addEventListener("keydown",e=>{ if(e.key==="Escape") setMenu(false); });
+// The status line lives inside the menu, which closes on tap, so mirror it below the bar.
+const stEl=document.getElementById("status"), stM=document.getElementById("status-m");
+new MutationObserver(()=>{ stM.textContent=stEl.textContent; stM.hidden=!stEl.textContent; })
+  .observe(stEl,{childList:true,characterData:true,subtree:true});
 
 document.getElementById("sync").onclick=async e=>{
-  const btn=e.target, st=document.getElementById("status");
+  const btn=e.currentTarget, st=document.getElementById("status");
   btn.disabled=true; st.textContent="Syncing...";
   try{
     const res=await fetch("/sync/run",{method:"POST"});
