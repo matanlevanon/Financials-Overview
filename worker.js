@@ -593,6 +593,18 @@ a{color:#8a8f98;font-size:13px}
 table{width:100%;border-collapse:collapse;margin:24px 0;font-size:13px}
 th{text-align:left;color:#8a8f98;font-weight:400;font-size:11px;text-transform:uppercase;padding:6px 10px;border-bottom:1px solid #232b34}
 td{padding:8px 10px;border-bottom:1px solid #171d24}
+html{-webkit-text-size-adjust:100%;text-size-adjust:100%}
+@media(max-width:700px){
+  body{padding:20px 14px 32px;font-size:15px}
+  h1{font-size:21px}
+  .sub,a,#status{font-size:14.5px}
+  button{width:100%;min-height:48px;font-size:16px}
+  button.small{width:auto;min-height:40px;padding:8px 14px;font-size:14px}
+  table{font-size:14.5px;display:block;overflow-x:auto}
+  th{font-size:12px}
+  td{padding:12px 8px}
+  .dupe{font-size:13px}
+}
 </style></head>
 <body>
 <h1>Link a bank</h1>
@@ -912,6 +924,83 @@ button:disabled{opacity:.5;cursor:default}
 .limrow select{width:180px}
 .limrow input:focus,.limrow select:focus{outline:none;border-color:var(--assets)}
 #limstatus,#catstatus{font-size:11px;color:var(--muted);margin-right:auto;align-self:center}
+html{-webkit-text-size-adjust:100%;text-size-adjust:100%}
+
+/* Phone layout. Desktop stays dense; under 700px every tap target is at least
+   44px tall and body text sits at 14-15px so it reads without zooming. */
+@media(max-width:700px){
+  body{font-size:15px;padding:12px max(12px,env(safe-area-inset-right)) 28px max(12px,env(safe-area-inset-left))}
+  header{flex-direction:column;align-items:stretch;gap:10px}
+  h1{font-size:19px}
+  .sub,.who{font-size:13px}
+  .controls{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+  .controls .who,#status,.controls a.btn{grid-column:1/-1}
+  .controls .who{display:flex;justify-content:space-between;align-items:center;order:-1}
+  .who a{padding:8px 0;font-size:14px}
+  button,a.btn{font-size:15px;padding:11px 14px;min-height:46px;border-radius:10px;text-align:center}
+  a.btn{display:flex;align-items:center;justify-content:center}
+  #status{font-size:13px}
+
+  .filterbar{font-size:13px;gap:8px}
+  .chip{font-size:14px;padding:6px 6px 6px 12px}
+  .chip button{font-size:20px;min-width:32px;min-height:32px;padding:0}
+
+  .page{gap:12px}
+  .colL,.panels,.pcol{gap:12px}
+  .card{padding:14px 14px;border-radius:13px}
+  .card h2{font-size:15px}
+  .card .cap{font-size:13px;margin-bottom:10px}
+  .btn-clear{font-size:13px;padding:6px 12px;min-height:36px;border-radius:8px}
+
+  .hero{flex-direction:column;align-items:stretch;gap:14px}
+  .hero-label{font-size:12px}
+  .hero-figure{font-size:36px}
+  .split{max-width:none;min-width:0}
+  .split-bar{height:24px}
+  .split-legend{font-size:13px}
+  .dot{width:10px;height:10px}
+
+  .kpis{grid-template-columns:1fr 1fr;gap:10px}
+  .kpi{padding:12px}
+  .kpi .k{font-size:12.5px;margin-bottom:4px}
+  .kpi .v{font-size:20px}
+  .kpi .d{font-size:12px}
+
+  .row{margin:0 -8px 4px;padding:10px 8px;border-radius:8px}
+  .row-top{font-size:14.5px;margin-bottom:7px}
+  .track{height:8px;border-radius:4px}
+  .fill{border-radius:4px}
+  .meta{font-size:12px;margin-top:5px}
+  .badge,.tag{font-size:11px;padding:1px 5px}
+  .pill{font-size:12px;padding:2px 8px}
+  .pill i{width:6px;height:6px}
+  .hold-t{font-size:12px}
+
+  .tx-day{font-size:12px;padding:14px 2px 6px}
+  .tx-row{padding:12px 6px;min-height:56px;gap:12px}
+  .tx-name{font-size:15px}
+  .tx-sub{font-size:12.5px;margin-top:2px}
+  .tx-amt{font-size:15px}
+  .empty{font-size:14px}
+
+  /* dialogs become bottom sheets */
+  .modal{align-items:flex-end;padding:0}
+  .modal-card{max-width:none;max-height:92vh;border-radius:16px 16px 0 0;border-bottom:0}
+  .modal-head{padding:18px 16px 0}
+  .modal-head h2{font-size:17px}
+  .modal .note{font-size:13.5px}
+  .modal-body{padding:10px 16px}
+  .modal-foot{padding:12px 16px max(16px,env(safe-area-inset-bottom));flex-wrap:wrap}
+  .modal-foot button{flex:1 1 0}
+  #limstatus,#catstatus{flex:1 1 100%;font-size:13px}
+  .limrow{flex-wrap:wrap;gap:8px;padding:12px 0}
+  .limrow .who{flex:1 1 100%}
+  .limrow .nm{font-size:15px;white-space:normal}
+  .limrow .sb{font-size:12.5px}
+  .limrow input,.limrow select{font-size:16px;padding:11px 12px;min-height:46px;border-radius:9px}
+  .limrow input{width:auto;flex:1 1 140px}
+  .limrow select{width:100%;flex:1 1 100%}
+}
 </style></head>
 <body>
 <header>
@@ -1402,6 +1491,7 @@ function loginPage(error) {
   return `<!doctype html>
 <html><head><meta charset="utf-8"><title>Finance Overview</title>
 <link rel="icon" href="/favicon.svg" type="image/svg+xml"><link rel="apple-touch-icon" href="/apple-touch-icon.png"><meta name="theme-color" content="#0f141b">
+<meta name="viewport" content="width=device-width,initial-scale=1">
 <style>
 body{font-family:system-ui,sans-serif;background:#0b0f14;color:#e6e6e6;margin:0;
   height:100vh;display:flex;align-items:center;justify-content:center}
@@ -1413,6 +1503,13 @@ a.google{display:inline-flex;align-items:center;gap:10px;background:#fff;color:#
   text-decoration:none;font-size:14px;font-weight:500;padding:10px 18px;border-radius:8px}
 a.google:hover{background:#f1f1f1}
 svg{width:18px;height:18px}
+@media(max-width:700px){
+  body{padding:16px}
+  .card{min-width:0;width:100%;max-width:400px;padding:32px 22px}
+  h1{font-size:21px}
+  .sub,.error{font-size:15px}
+  a.google{display:flex;justify-content:center;font-size:16px;min-height:50px}
+}
 </style></head>
 <body>
 <div class="card">
