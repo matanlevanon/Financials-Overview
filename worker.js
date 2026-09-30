@@ -786,6 +786,13 @@ async function handleDashboard(env, email) {
 <html lang="en"><head><meta charset="utf-8"><title>Finance Overview</title>
 <link rel="icon" href="/favicon.svg" type="image/svg+xml"><link rel="apple-touch-icon" href="/apple-touch-icon.png"><meta name="theme-color" content="#0f141b">
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<script>
+// Saved choice wins, otherwise follow the phone or computer setting.
+(function(){var t=null;try{t=localStorage.getItem("fin-theme");}catch(e){}
+if(t!=="light"&&t!=="dark")t=window.matchMedia&&matchMedia("(prefers-color-scheme: light)").matches?"light":"dark";
+document.documentElement.setAttribute("data-theme",t);
+var m=document.querySelector('meta[name="theme-color"]');if(m)m.content=t==="light"?"#f4f4f1":"#0f141b";})();
+</script>
 <style>
 :root{color-scheme:dark;
   --plane:#0a0e13;--card:#141a21;--text-primary:#fff;--text-secondary:#c3c2b7;--muted:#898781;
@@ -1502,11 +1509,17 @@ catModal.addEventListener("click",e=>{ if(e.target===catModal) closeCats(); });
 const tb=document.getElementById("theme"), tbi=document.getElementById("theme-ico");
 const ICON_SUN=tbi.innerHTML;
 const ICON_MOON='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>';
-tb.onclick=()=>{ const light=document.documentElement.getAttribute("data-theme")==="light";
-  document.documentElement.setAttribute("data-theme",light?"dark":"light"); tb.textContent=light?"Light":"Dark";
-  // the icon shows the mode a tap switches to
-  tbi.innerHTML=light?ICON_SUN:ICON_MOON;
-  tbi.setAttribute("aria-label", light?"Switch to light mode":"Switch to dark mode"); };
+function applyTheme(t){
+  document.documentElement.setAttribute("data-theme",t);
+  // label and icon show the mode a tap switches to
+  tb.textContent=t==="light"?"Dark":"Light";
+  tbi.innerHTML=t==="light"?ICON_MOON:ICON_SUN;
+  tbi.setAttribute("aria-label", t==="light"?"Switch to dark mode":"Switch to light mode");
+  const m=document.querySelector('meta[name="theme-color"]'); if(m) m.content=t==="light"?"#f4f4f1":"#0f141b";
+}
+applyTheme(document.documentElement.getAttribute("data-theme")==="light"?"light":"dark");
+tb.onclick=()=>{ const next=document.documentElement.getAttribute("data-theme")==="light"?"dark":"light";
+  applyTheme(next); try{ localStorage.setItem("fin-theme",next); }catch(e){} };
 tbi.onclick=()=>tb.click();
 
 // Phone overflow menu. On desktop the same buttons sit inline and none of this fires.
