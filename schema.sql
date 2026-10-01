@@ -68,3 +68,24 @@ CREATE TABLE IF NOT EXISTS category_overrides (
   category TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
+
+-- Alert rules set in the dashboard's Alerts dialog. Each is a filter over new
+-- transactions. An empty column matches anything. The Worker also creates this
+-- table on first use, so an existing database needs no manual step.
+-- currency: NULL any, 'USD' exactly, '!USD' anything except. direction: NULL, 'in', 'out'.
+-- webhook: NULL posts to SLACK_WEBHOOK_URL.
+CREATE TABLE IF NOT EXISTS alert_rules (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  account_id TEXT,
+  currency TEXT,
+  direction TEXT,
+  min_amount REAL,
+  category TEXT,
+  match TEXT,
+  include_pending INTEGER NOT NULL DEFAULT 0,
+  webhook TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);

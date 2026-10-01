@@ -14,7 +14,7 @@
 // Optional:
 //   PLAID_ENV                   -> "production" (default) or "sandbox"
 //   OPENFINANCE_API_KEY         -> if set, also pulls from OpenFinance
-//   SLACK_WEBHOOK_URL           -> enables Slack alerts
+//   SLACK_WEBHOOK_URL           -> default channel for Slack alerts and rules
 //   ALERT_LARGE_TX              -> default 1000
 //   ALERT_LOW_BALANCE           -> default 500
 //   SYNC_DAYS                   -> days of transaction history, default 30
@@ -461,6 +461,155 @@ async function store(env, accounts, transactions) {
   }
 }
 
+/* ------------------------------------------------------------ alert rules */
+
+// Rules you set in the dashboard's Alerts dialog. Each one is a filter over new
+// transactions. Every condition left empty matches anything, so a rule with
+// only "money in" and "not USD" fires on every foreign currency deposit.
+//
+// The table is created on first use, so a deploy needs no manual migration.
+// schema.sql carries the same statement for a fresh database.
+const RULES_DDL = `CREATE TABLE IF NOT EXISTS alert_rules (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  account_id TEXT,
+  currency TEXT,
+  direction TEXT,
+  min_amount REAL,
+  category TEXT,
+  match TEXT,
+  include_pending INTEGER NOT NULL DEFAULT 0,
+  webhook TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+)`;
+let rulesTableReady = false;
+async function ensureRulesTable(env) {
+  if (rulesTableReady) return;
+  await env.DB.prepare(RULES_DDL).run();
+  rulesTableReady = true;
+}
+
+// Shared by the Worker and the dashboard page, which injects this exact source
+// so the "would have matched" preview in the dialog cannot drift from what the
+// Worker actually sends. Keep it self-contained: no outside names.
+//   rule: a row from alert_rules
+//   tx:   { amount, currency, category, name, pending, date }
+//   acct: { id }
+function ruleMatches(rule, tx, acct) {
+  if (!rule || !tx) return false;
+  if (tx.pending && !rule.include_pending) return false;
+  if (rule.account_id && (!acct || rule.account_id !== acct.id)) return false;
+  const cur = String(tx.currency || "").toUpperCase();
+  if (rule.currency) {
+    const c = String(rule.currency).toUpperCase();
+    if (c.charAt(0) === "!") { if (cur === c.slice(1)) return false; }
+    else if (cur !== c) return false;
+  }
+  const amt = Number(tx.amount) || 0;
+  if (rule.direction === "in" && !(amt > 0)) return false;
+  if (rule.direction === "out" && !(amt < 0)) return false;
+  if (rule.category && tx.category !== rule.category) return false;
+  if (rule.match && String(tx.name || "").toLowerCase().indexOf(String(rule.match).toLowerCase()) === -1) return false;
+  if (rule.min_amount != null && rule.min_amount !== "") {
+    const min = Number(rule.min_amount);
+    if (isFinite(min) && min > 0) {
+      // Compared in the transaction's own currency. Plaid accounts are
+      // almost always dollars, so there is no conversion here.
+      const v = Math.abs(amt);
+      if (v < min) return false;
+    }
+  }
+  // Only transactions dated from three days before the rule was created, to
+  // allow for bank posting lag. Without the cutoff a new rule would fire on the
+  // whole 30-day window the next sync re-sends.
+  if (rule.created_at) {
+    const d = new Date(String(rule.created_at).slice(0, 10) + "T00:00:00Z");
+    d.setUTCDate(d.getUTCDate() - 3);
+    if (String(tx.date || "").slice(0, 10) < d.toISOString().slice(0, 10)) return false;
+  }
+  return true;
+}
+
+const RULE_DIRECTIONS = new Set(["", "in", "out"]);
+
+// Turns whatever the dialog posted into a clean row, or throws a message the
+// dialog shows as is.
+function cleanRule(body) {
+  const str = (v, max = 200) => (v == null ? "" : String(v).trim().slice(0, max));
+  const name = str(body.name, 80);
+  if (!name) throw new Error("Give the rule a name");
+  const direction = str(body.direction);
+  if (!RULE_DIRECTIONS.has(direction)) throw new Error("Unknown direction");
+  const currency = str(body.currency, 4).toUpperCase();
+  if (currency && !/^!?[A-Z]{3}$/.test(currency)) throw new Error("Currency must be a 3-letter code");
+  let min = null;
+  if (body.min_amount !== null && body.min_amount !== undefined && String(body.min_amount).trim() !== "") {
+    min = Number(body.min_amount);
+    if (!isFinite(min) || min < 0) throw new Error("Minimum amount must be a positive number");
+  }
+  const webhook = str(body.webhook, 300);
+  if (webhook && !/^https:\/\/hooks\.slack\.com\//.test(webhook)) {
+    throw new Error("Slack webhook must start with https://hooks.slack.com/");
+  }
+  return {
+    name, account_id: str(body.account_id) || null,
+    currency: currency || null, direction: direction || null,
+    min_amount: min, category: str(body.category, 40) || null,
+    match: str(body.match, 80) || null, include_pending: body.include_pending ? 1 : 0,
+    enabled: body.enabled === false || body.enabled === 0 ? 0 : 1, webhook: webhook || null
+  };
+}
+
+async function listRules(env) {
+  await ensureRulesTable(env);
+  const r = await env.DB.prepare("SELECT * FROM alert_rules ORDER BY id").all();
+  return r.results || [];
+}
+
+async function postSlack(url, text) {
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ text })
+  });
+  if (!res.ok) throw new Error(`Slack returned ${res.status}`);
+}
+
+function ruleMessage(tag, rule, tx, acct) {
+  const amt = Number(tx.amount) || 0;
+  const verb = amt > 0 ? "Money in" : "Money out";
+  const figure = Math.abs(amt).toLocaleString("en-US", { maximumFractionDigits: 2 });
+  return `${tag}${rule.name}: ${verb} ${figure} ${tx.currency} · ${acct ? acct.name : tx.account_id} · ${tx.name} · ${tx.date}` +
+    (tx.pending ? " (pending)" : "");
+}
+
+// Evaluated on every sync and every Israeli push, on the transactions that
+// batch carried. Deduped per rule and transaction through alerts_log.
+async function runRules(env, transactions, tag) {
+  if (!transactions.length) return [];
+  const rules = (await listRules(env)).filter((r) => r.enabled);
+  if (!rules.length) return [];
+  const acctRows = await env.DB.prepare("SELECT id, name, currency FROM accounts").all();
+  const accts = new Map((acctRows.results || []).map((a) => [a.id, a]));
+  const ovRows = await env.DB.prepare("SELECT merchant, category FROM category_overrides").all();
+  const overrides = new Map((ovRows.results || []).map((o) => [o.merchant, o.category]));
+
+  const out = [];
+  for (const t of transactions) {
+    const tx = { ...t, category: overrides.get(t.name) || t.category || "OTHER" };
+    const acct = accts.get(t.account_id);
+    for (const r of rules) {
+      if (!ruleMatches(r, tx, acct)) continue;
+      const webhook = r.webhook || env.SLACK_WEBHOOK_URL;
+      if (!webhook) continue;
+      out.push({ key: `rule:${r.id}:${t.id}`, message: ruleMessage(tag, r, tx, acct), webhook });
+    }
+  }
+  return out;
+}
+
 /* ----------------------------------------------------------------- alerts */
 
 // Moving money between your own accounts is not spending, so it never alerts.
@@ -473,7 +622,6 @@ const DEPOSIT_TYPES = new Set(["checking", "savings", "money market", "cash mana
 // every run for as long as the condition holds.
 async function runAlerts(env, accounts, transactions) {
   const webhook = env.SLACK_WEBHOOK_URL;
-  if (!webhook) return 0;
 
   const largeTx = Number(env.ALERT_LARGE_TX || 1000);
   const lowBalance = Number(env.ALERT_LOW_BALANCE || 500);
@@ -483,7 +631,9 @@ async function runAlerts(env, accounts, transactions) {
   const candidates = [];
   const recovered = [];
 
-  for (const a of accounts) {
+  // The two fixed alerts need the default webhook. Rules can carry their own,
+  // so they run either way.
+  for (const a of webhook ? accounts : []) {
     if (!DEPOSIT_TYPES.has(String(a.type || "").toLowerCase())) continue;
     const key = `low_balance:${a.id}`;
     if (a.balance < lowBalance) {
@@ -496,7 +646,7 @@ async function runAlerts(env, accounts, transactions) {
       recovered.push(key);
     }
   }
-  for (const t of transactions) {
+  for (const t of webhook ? transactions : []) {
     if (ALERT_SKIP_CATEGORIES.has(t.category)) continue;
     if (Math.abs(t.amount) >= largeTx) {
       candidates.push({
@@ -506,32 +656,48 @@ async function runAlerts(env, accounts, transactions) {
     }
   }
 
+  for (const c of candidates) c.webhook = webhook;
+  // A broken rule must not stop the fixed alerts, so its error is logged and
+  // the run carries on.
+  try {
+    candidates.push(...await runRules(env, transactions, tag));
+  } catch (err) {
+    console.log("rules failed: " + err.message);
+  }
+
   if (recovered.length) {
     const ph = recovered.map(() => "?").join(",");
     await env.DB.prepare(`DELETE FROM alerts_log WHERE rule IN (${ph})`).bind(...recovered).run();
   }
   if (!candidates.length) return 0;
 
-  const placeholders = candidates.map(() => "?").join(",");
-  const seen = await env.DB.prepare(`SELECT rule FROM alerts_log WHERE rule IN (${placeholders})`)
-    .bind(...candidates.map((c) => c.key)).all();
-  const already = new Set((seen.results || []).map((r) => r.rule));
+  // D1 caps bound parameters at 100 per statement, so look keys up in chunks.
+  const already = new Set();
+  for (let i = 0; i < candidates.length; i += 90) {
+    const chunk = candidates.slice(i, i + 90);
+    const seen = await env.DB.prepare(
+      `SELECT rule FROM alerts_log WHERE rule IN (${chunk.map(() => "?").join(",")})`
+    ).bind(...chunk.map((c) => c.key)).all();
+    for (const r of seen.results || []) already.add(r.rule);
+  }
   const fresh = candidates.filter((c) => !already.has(c.key));
   if (!fresh.length) return 0;
 
   const sentAt = new Date().toISOString();
-  for (const c of fresh) {
-    await fetch(webhook, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ text: c.message })
-    });
+  // Capped per run: a Worker gets 50 outbound requests per invocation on the
+  // free plan, and the bank fetches already used some. The rest go next run.
+  // Only what Slack accepted goes into the log, so a failed post retries.
+  const sent = [];
+  for (const c of fresh.slice(0, 25)) {
+    try { await postSlack(c.webhook, c.message); sent.push(c); }
+    catch (err) { console.log("slack post failed: " + err.message); }
   }
-  await env.DB.batch(fresh.map((c) =>
+  if (!sent.length) return 0;
+  await env.DB.batch(sent.map((c) =>
     env.DB.prepare("INSERT INTO alerts_log (rule, message, sent_at) VALUES (?, ?, ?)")
       .bind(c.key, c.message, sentAt)
   ));
-  return fresh.length;
+  return sent.length;
 }
 
 async function syncNow(env) {
@@ -739,7 +905,7 @@ document.getElementById('go').onclick = (e) => openLink(null, e.target);
 async function handleDashboard(env, email) {
   const acctRows = await env.DB.prepare("SELECT * FROM accounts ORDER BY balance DESC").all();
   const txRows = await env.DB.prepare(
-    "SELECT date, name, amount, category, account_id, pending FROM transactions ORDER BY date DESC LIMIT 800"
+    "SELECT date, name, amount, currency, category, account_id, pending FROM transactions ORDER BY date DESC LIMIT 800"
   ).all();
   const holdRows = await env.DB.prepare("SELECT * FROM holdings ORDER BY value DESC").all();
   const ovRows = await env.DB.prepare("SELECT merchant, category FROM category_overrides").all();
@@ -769,6 +935,7 @@ async function handleDashboard(env, email) {
     date: t.date,
     name: t.name,
     amount: Number(t.amount) || 0,
+    cur: t.currency || "USD",
     category: overrides[t.name] || t.category || "OTHER",
     account: t.account_id,
     pending: t.pending ? 1 : 0
@@ -930,6 +1097,35 @@ button:disabled{opacity:.5;cursor:default}
 .limrow input{width:110px;text-align:right;font-variant-numeric:tabular-nums}
 .limrow select{width:180px}
 .limrow input:focus,.limrow select:focus{outline:none;border-color:var(--assets)}
+.rule-row .acts{display:flex;gap:6px;flex-shrink:0;align-items:center}
+.rule-row .acts button{font-size:11px;padding:5px 9px}
+.rule-row .acts button.danger{color:var(--debt);border-color:var(--debt)}
+.rule-row.off .nm,.rule-row.off .sb{opacity:.5}
+.rule-row .sw{display:flex;align-items:center;gap:6px;font-size:11px;color:var(--muted);cursor:pointer}
+.rule-row .sw input{width:auto;margin:0}
+.rform{display:grid;grid-template-columns:1fr 1fr;gap:10px 12px;padding:4px 0}
+.rform label{display:flex;flex-direction:column;gap:4px;font-size:10.5px;color:var(--muted)}
+.rform label.full{grid-column:1 / -1}
+.rform label.chk{flex-direction:row;align-items:center;gap:8px;font-size:12px;color:var(--text-primary)}
+.rform input:not([type=checkbox]),.rform select{background:var(--plane);border:1px solid var(--border);border-radius:6px;
+  color:var(--text-primary);font-size:12px;padding:7px 8px;font-family:inherit;width:100%;box-sizing:border-box}
+.rform input:focus,.rform select:focus{outline:none;border-color:var(--assets)}
+.rform .pair{display:flex;gap:6px}
+.rform .pair select{width:84px;flex-shrink:0}
+.rprev{grid-column:1 / -1;font-size:11px;color:var(--muted);line-height:1.6;border-top:1px solid var(--grid);padding-top:8px}
+.rprev .ex{color:var(--text-primary);font-variant-numeric:tabular-nums}
+.rwarn{font-size:11px;color:var(--debt);margin:6px 0 0}
+#rulestatus{font-size:11px;color:var(--muted);margin-right:auto;align-self:center}
+@media(max-width:700px){
+  .rform{grid-template-columns:1fr}
+  .rform label{font-size:13px}
+  .rform label.chk{font-size:14px}
+  .rform input:not([type=checkbox]),.rform select{font-size:16px;padding:11px 12px;min-height:46px;border-radius:9px}
+  .rule-row{flex-wrap:wrap}
+  .rule-row .acts{width:100%}
+  .rule-row .acts button{flex:1 1 0;min-height:40px}
+  #rulestatus{flex:1 1 100%;font-size:13px}
+}
 #limstatus,#catstatus{font-size:11px;color:var(--muted);margin-right:auto;align-self:center}
 html{-webkit-text-size-adjust:100%;text-size-adjust:100%}
 .appbar-actions,.status-m,.controls svg{display:none}
@@ -1053,6 +1249,7 @@ html{-webkit-text-size-adjust:100%;text-size-adjust:100%}
     <button id="sync"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 11a8 8 0 0 0-14.3-4.9L4 8M4 4v4h4M4 13a8 8 0 0 0 14.3 4.9L20 16M20 20v-4h-4"/></svg><span>Sync now</span></button>
     <button id="limits"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2.5" y="5" width="19" height="14" rx="2.5"/><path d="M2.5 10h19M6 15h4"/></svg><span>Credit limits</span></button>
     <button id="cats-btn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20.6 13.4l-7.2 7.2a2 2 0 0 1-2.8 0L3 13V3h10l7.6 7.6a2 2 0 0 1 0 2.8z"/><circle cx="7.5" cy="7.5" r="1.5"/></svg><span>Categories</span></button>
+    <button id="rules-btn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.9 1.9 0 0 0 3.4 0"/></svg><span>Alerts</span></button>
     <button id="theme">Light</button>
     <span id="status"></span>
   </div>
@@ -1140,6 +1337,17 @@ html{-webkit-text-size-adjust:100%;text-size-adjust:100%}
     <div class="modal-body" id="catrows"></div>
     <div class="modal-foot"><span id="catstatus"></span>
       <button id="catcancel">Cancel</button><button id="catsave" class="primary">Save</button></div>
+  </div>
+</div>
+
+<div class="modal" id="rulemodal" hidden>
+  <div class="modal-card" role="dialog" aria-modal="true">
+    <div class="modal-head"><h2 id="ruletitle">Alerts</h2>
+      <p class="note" id="rulenote">Each rule posts to Slack when a new transaction matches it.
+      Empty fields match anything. Rules check transactions from three days before you create them onward.</p></div>
+    <div class="modal-body" id="rulebody"></div>
+    <div class="modal-foot"><span id="rulestatus"></span>
+      <button id="rulecancel">Close</button><button id="ruleadd" class="primary">Add rule</button></div>
   </div>
 </div>
 
@@ -1477,6 +1685,146 @@ async function saveCats(){
   closeCats(); state.category=null; render();
 }
 
+/* ---- alert rules modal ---- */
+// Same function the Worker runs, injected from its source.
+${ruleMatches.toString()}
+const ruleModal=document.getElementById("rulemodal");
+const ruleBody=document.getElementById("rulebody"), ruleStatus=document.getElementById("rulestatus");
+const ruleAdd=document.getElementById("ruleadd"), ruleCancel=document.getElementById("rulecancel");
+let RULES=[], RULE_DEFAULT_HOOK=false, ruleEditing=null;
+const CUR_OPTS=[["","Any currency"],["!USD","Foreign currency (not USD)"],
+  ["USD","USD"],["EUR","EUR"],["GBP","GBP"],["CAD","CAD"]];
+const ruleAcct=id=>ACCOUNTS.find(a=>a.id===id);
+function ruleSummary(r){
+  const p=[];
+  p.push(r.direction==="in"?"Money in":r.direction==="out"?"Money out":"Any transaction");
+  if(r.account_id){ const a=ruleAcct(r.account_id); p.push(a?a.name:"a removed account"); }
+  if(r.currency){ const o=CUR_OPTS.find(c=>c[0]===r.currency); p.push(o?o[1]:r.currency); }
+  if(r.min_amount!=null) p.push("from "+Number(r.min_amount).toLocaleString());
+  if(r.category) p.push(LABEL[r.category]||r.category);
+  if(r.match) p.push('name has "'+r.match+'"');
+  if(r.include_pending) p.push("incl. pending");
+  p.push(r.webhook_tail?"own channel ··"+r.webhook_tail:"default channel");
+  return p.join(" · ");
+}
+async function loadRules(){
+  ruleStatus.textContent="Loading...";
+  const res=await fetch("/api/rules"); const b=await res.json().catch(()=>({}));
+  if(!res.ok){ ruleStatus.textContent="Could not load rules: "+(b.error||res.status); return false; }
+  RULES=b.rules||[]; RULE_DEFAULT_HOOK=!!b.default_webhook; ruleStatus.textContent=""; return true;
+}
+function showRuleList(){
+  ruleEditing=null;
+  document.getElementById("ruletitle").textContent="Alerts";
+  document.getElementById("rulenote").hidden=false;
+  ruleAdd.textContent="Add rule"; ruleCancel.textContent="Close";
+  const warn=RULE_DEFAULT_HOOK?"":'<p class="rwarn">No default Slack webhook is set, so only rules with their own webhook will post.</p>';
+  ruleBody.innerHTML=warn+(RULES.length?RULES.map(r=>
+    '<div class="limrow rule-row'+(r.enabled?"":" off")+'"><div class="who"><div class="nm">'+esc(r.name)+'</div>'+
+    '<div class="sb">'+esc(ruleSummary(r))+'</div></div><div class="acts">'+
+    '<label class="sw"><input type="checkbox" data-rtoggle="'+r.id+'"'+(r.enabled?" checked":"")+'>On</label>'+
+    '<button data-rtest="'+r.id+'">Test</button><button data-redit="'+r.id+'">Edit</button>'+
+    '<button class="danger" data-rdel="'+r.id+'">Delete</button></div></div>').join("")
+    :'<div class="empty">No rules yet. Add one to get a Slack message when a transaction matches.</div>');
+}
+function opt(v,l,cur){ return '<option value="'+esc(v)+'"'+(cur===v?" selected":"")+'>'+esc(l)+'</option>'; }
+function showRuleForm(r){
+  ruleEditing=r||{};
+  const x=ruleEditing;
+  document.getElementById("ruletitle").textContent=r?"Edit rule":"New rule";
+  document.getElementById("rulenote").hidden=true;
+  ruleAdd.textContent="Save"; ruleCancel.textContent="Back";
+  const accts=ACCOUNTS.slice().sort((a,b)=>a.name.localeCompare(b.name));
+  ruleBody.innerHTML='<div class="rform">'+
+    '<label class="full">Name<input id="rf-name" maxlength="80" placeholder="Foreign currency deposit" value="'+esc(x.name||"")+'"></label>'+
+    '<label>Money<select id="rf-dir">'+opt("","In or out",x.direction||"")+opt("in","Money in",x.direction||"")+opt("out","Money out",x.direction||"")+'</select></label>'+
+    '<label>Category<select id="rf-cat">'+opt("","Any",x.category||"")+CATS.map(c=>opt(c,LABEL[c]||c,x.category||"")).join("")+'</select></label>'+
+    '<label class="full">Account<select id="rf-acct">'+opt("","Any account",x.account_id||"")+
+      accts.map(a=>opt(a.id,a.name+" ("+a.cur+")",x.account_id||"")).join("")+'</select></label>'+
+    '<label>Currency<select id="rf-cur">'+CUR_OPTS.map(c=>opt(c[0],c[1],x.currency||"")).join("")+'</select></label>'+
+    '<label>Minimum amount<input id="rf-min" type="number" min="0" step="any" placeholder="Any" value="'+(x.min_amount!=null?x.min_amount:"")+'"></label>'+
+    '<label>Name contains<input id="rf-match" maxlength="80" placeholder="Any" value="'+esc(x.match||"")+'"></label>'+
+    '<label class="full">Slack webhook for this rule<input id="rf-hook" placeholder="'+
+      (x.webhook_tail?"Keeps the saved one (··"+esc(x.webhook_tail)+")":RULE_DEFAULT_HOOK?"Blank uses the default channel":"https://hooks.slack.com/services/...")+'"></label>'+
+    (x.webhook_tail?'<label class="chk full"><input type="checkbox" id="rf-clearhook">Remove the webhook on this rule and use the default channel</label>':"")+
+    '<label class="chk full"><input type="checkbox" id="rf-pend"'+(x.include_pending?" checked":"")+'>Include pending transactions (a pending item that posts later alerts twice)</label>'+
+    '<div class="rprev" id="rf-prev"></div></div>';
+  ruleBody.querySelectorAll("input,select").forEach(el=>{ el.oninput=previewRule; el.onchange=previewRule; });
+  previewRule();
+  document.getElementById("rf-name").focus();
+}
+function readRuleForm(){
+  const v=id=>document.getElementById(id);
+  return { id:ruleEditing&&ruleEditing.id||undefined, name:v("rf-name").value.trim(),
+    direction:v("rf-dir").value, account_id:v("rf-acct").value,
+    currency:v("rf-cur").value, min_amount:v("rf-min").value,
+    category:v("rf-cat").value, match:v("rf-match").value.trim(), include_pending:v("rf-pend").checked,
+    webhook:v("rf-hook").value.trim(), clear_webhook:!!(v("rf-clearhook")&&v("rf-clearhook").checked),
+    enabled:ruleEditing&&ruleEditing.id?!!ruleEditing.enabled:true };
+}
+// Runs the rule over the last 90 days loaded on the page, ignoring the
+// created-at cutoff, so you see what kind of traffic it would send.
+function previewRule(){
+  const f=readRuleForm();
+  const r={...f, min_amount:f.min_amount===""?null:Number(f.min_amount), include_pending:f.include_pending?1:0, created_at:null};
+  const since=new Date(Date.now()-90*864e5).toISOString().slice(0,10);
+  const hits=TX.filter(t=>t.date>=since && ruleMatches(r,
+    {amount:t.amount,currency:t.cur,category:t.category,name:t.name,pending:t.pending,date:t.date},
+    ruleAcct(t.account)||{id:t.account}));
+  const box=document.getElementById("rf-prev");
+  box.innerHTML='<b>'+hits.length+'</b> transaction'+(hits.length===1?"":"s")+' in the last 90 days would have matched.'+
+    (hits.length?'<br>'+hits.slice(0,4).map(t=>'<span class="ex">'+esc(t.date)+' · '+
+      (t.amount>0?"+":"")+Number(t.amount).toLocaleString()+' '+esc(t.cur)+'</span> '+esc(t.name)).join("<br>"):"")+
+    (hits.length>30?'<br>That is a lot of messages. Add a minimum amount or narrow the account.':"");
+}
+async function openRules(){
+  ruleModal.hidden=false; ruleBody.innerHTML="";
+  if(await loadRules()) showRuleList();
+}
+function closeRules(){ ruleModal.hidden=true; ruleEditing=null; }
+async function rulePost(url,body){
+  const res=await fetch(url,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(body)});
+  const b=await res.json().catch(()=>({}));
+  if(!res.ok) throw new Error(b.error||String(res.status));
+  return b;
+}
+ruleAdd.onclick=async()=>{
+  if(!ruleEditing) return showRuleForm(null);
+  const f=readRuleForm();
+  ruleStatus.textContent="Saving...";
+  try{ await rulePost("/api/rules",f); }catch(err){ ruleStatus.textContent=err.message; return; }
+  await loadRules(); showRuleList(); ruleStatus.textContent="Saved";
+};
+ruleCancel.onclick=()=>{ if(ruleEditing){ ruleStatus.textContent=""; showRuleList(); } else closeRules(); };
+ruleModal.addEventListener("click",async e=>{
+  if(e.target===ruleModal) return closeRules();
+  const t=e.target.closest("[data-rtest],[data-redit],[data-rdel]");
+  if(!t) return;
+  if(t.dataset.redit) return showRuleForm(RULES.find(r=>String(r.id)===t.dataset.redit));
+  if(t.dataset.rtest){
+    ruleStatus.textContent="Sending test...";
+    try{ await rulePost("/api/rules/test",{id:Number(t.dataset.rtest)}); ruleStatus.textContent="Test sent. Check Slack."; }
+    catch(err){ ruleStatus.textContent="Test failed: "+err.message; }
+    return;
+  }
+  if(t.dataset.rdel){
+    // Two-step confirm rather than a browser dialog.
+    if(t.dataset.armed!=="1"){ t.dataset.armed="1"; t.textContent="Confirm"; return; }
+    ruleStatus.textContent="Deleting...";
+    try{ await rulePost("/api/rules/delete",{id:Number(t.dataset.rdel)}); }
+    catch(err){ ruleStatus.textContent="Delete failed: "+err.message; return; }
+    await loadRules(); showRuleList(); ruleStatus.textContent="Deleted";
+  }
+});
+ruleModal.addEventListener("change",async e=>{
+  const c=e.target.closest("[data-rtoggle]"); if(!c) return;
+  try{ await rulePost("/api/rules/toggle",{id:Number(c.dataset.rtoggle),enabled:c.checked});
+    const r=RULES.find(x=>String(x.id)===c.dataset.rtoggle); if(r) r.enabled=c.checked?1:0;
+    c.closest(".rule-row").classList.toggle("off",!c.checked); ruleStatus.textContent=c.checked?"Rule on":"Rule paused"; }
+  catch(err){ c.checked=!c.checked; ruleStatus.textContent="Failed: "+err.message; }
+});
+document.getElementById("rules-btn").onclick=openRules;
+
 /* ---- events ---- */
 document.addEventListener("click",e=>{
   const c=e.target.closest("[data-clear]");
@@ -1495,6 +1843,7 @@ document.addEventListener("keydown",e=>{
   if(e.key==="Escape"){
     if(!limModal.hidden) closeLimits();
     if(!catModal.hidden) closeCats();
+    if(!ruleModal.hidden){ if(ruleEditing) showRuleList(); else closeRules(); }
   }
 });
 document.getElementById("limits").onclick=openLimits;
@@ -1742,6 +2091,86 @@ export default {
         await env.DB.prepare("DELETE FROM category_overrides WHERE merchant = ?").bind(merchant).run();
       }
       return json({ ok: true, merchant, category });
+    }
+
+    // Alert rules. The dialog lists, saves, deletes and test-fires them here.
+    if (path === "/api/rules" && request.method === "GET") {
+      if (!session) return json({ error: "Not signed in" }, 401);
+      // Webhooks are secrets of a sort. The page gets a masked tail, enough to
+      // tell two channels apart, never the full URL.
+      const rules = (await listRules(env)).map((r) => ({
+        ...r, webhook: undefined, webhook_tail: r.webhook ? r.webhook.slice(-6) : null
+      }));
+      return json({ rules, default_webhook: !!env.SLACK_WEBHOOK_URL });
+    }
+
+    if (path === "/api/rules" && request.method === "POST") {
+      if (!session) return json({ error: "Not signed in" }, 401);
+      const body = await request.json().catch(() => ({}));
+      let r;
+      try { r = cleanRule(body); } catch (err) { return json({ error: err.message }, 400); }
+      await ensureRulesTable(env);
+      const now = new Date().toISOString();
+      const id = body.id ? Number(body.id) : null;
+      if (id) {
+        // A blank webhook field on edit keeps the stored one. The page never
+        // has the full URL, so it cannot send it back. clear_webhook=true clears it.
+        const keep = !r.webhook && body.clear_webhook !== true;
+        const res = await env.DB.prepare(
+          `UPDATE alert_rules SET name=?, enabled=?, account_id=?, currency=?, direction=?,
+             min_amount=?, category=?, match=?, include_pending=?,
+             webhook=${keep ? "webhook" : "?"}, updated_at=? WHERE id=?`
+        ).bind(...[r.name, r.enabled, r.account_id, r.currency, r.direction, r.min_amount,
+                   r.category, r.match, r.include_pending,
+                   ...(keep ? [] : [r.webhook]), now, id]).run();
+        if (!res.meta || res.meta.changes === 0) return json({ error: "Unknown rule" }, 404);
+        return json({ ok: true, id });
+      }
+      const res = await env.DB.prepare(
+        `INSERT INTO alert_rules (name, enabled, account_id, currency, direction, min_amount,
+           category, match, include_pending, webhook, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ).bind(r.name, r.enabled, r.account_id, r.currency, r.direction, r.min_amount,
+             r.category, r.match, r.include_pending, r.webhook, now, now).run();
+      return json({ ok: true, id: res.meta && res.meta.last_row_id });
+    }
+
+    if (path === "/api/rules/toggle" && request.method === "POST") {
+      if (!session) return json({ error: "Not signed in" }, 401);
+      const body = await request.json().catch(() => ({}));
+      await ensureRulesTable(env);
+      const res = await env.DB.prepare("UPDATE alert_rules SET enabled=?, updated_at=? WHERE id=?")
+        .bind(body.enabled ? 1 : 0, new Date().toISOString(), Number(body.id)).run();
+      if (!res.meta || res.meta.changes === 0) return json({ error: "Unknown rule" }, 404);
+      return json({ ok: true });
+    }
+
+    if (path === "/api/rules/delete" && request.method === "POST") {
+      if (!session) return json({ error: "Not signed in" }, 401);
+      const body = await request.json().catch(() => ({}));
+      await ensureRulesTable(env);
+      const id = Number(body.id);
+      await env.DB.prepare("DELETE FROM alert_rules WHERE id=?").bind(id).run();
+      // Its sent-log rows go too, so a rule re-created later starts clean.
+      await env.DB.prepare("DELETE FROM alerts_log WHERE rule LIKE ?").bind(`rule:${id}:%`).run();
+      return json({ ok: true });
+    }
+
+    if (path === "/api/rules/test" && request.method === "POST") {
+      if (!session) return json({ error: "Not signed in" }, 401);
+      const body = await request.json().catch(() => ({}));
+      await ensureRulesTable(env);
+      const row = await env.DB.prepare("SELECT * FROM alert_rules WHERE id=?").bind(Number(body.id)).first();
+      if (!row) return json({ error: "Unknown rule" }, 404);
+      const url = row.webhook || env.SLACK_WEBHOOK_URL;
+      if (!url) return json({ error: "No Slack webhook. Add one to the rule or set SLACK_WEBHOOK_URL." }, 400);
+      const tag = env.ALERT_PREFIX === "" ? "" : (env.ALERT_PREFIX || "*Finance*") + "  ";
+      try {
+        await postSlack(url, `${tag}Test from rule "${row.name}". Matching transactions will post here.`);
+      } catch (err) {
+        return json({ error: err.message }, 502);
+      }
+      return json({ ok: true });
     }
 
     if (path === "/api/limit" && request.method === "POST") {

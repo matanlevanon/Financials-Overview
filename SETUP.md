@@ -129,7 +129,12 @@ sync status line names the institution and the reason.
 
 ## Optional: Slack alerts
 
-Alerts fire for transactions above a threshold and cash balances below one.
+Two kinds of alert post to Slack:
+
+- **Rules** you set in the dashboard. Open **Alerts**, add a rule, and pick what it matches: money in or out, account, currency, minimum amount, category, merchant text. Each rule can carry its own webhook to post to a different channel. Leave it blank to use the default one below.
+- **Fixed alerts** for transactions above a threshold and cash balances below one, set with secrets.
+
+The default webhook:
 
 1. Create a Slack app at https://api.slack.com/apps, choose **From scratch**.
 2. Open **Incoming Webhooks** and turn on **Activate Incoming Webhooks**.
@@ -143,7 +148,9 @@ wrangler deploy
 
 Tune the thresholds with `ALERT_LARGE_TX` (default 1000) and `ALERT_LOW_BALANCE` (default 500). Set `ALERT_LOW_BALANCE` to `0` to switch low balance alerts off.
 
-Alerts are deduplicated. Large transactions fire once. Low balances fire once when an account drops below the line and rearm when it recovers.
+Alerts are deduplicated. Large transactions fire once. Low balances fire once when an account drops below the line and rearm when it recovers. Rules fire once per transaction and only for transactions dated from three days before the rule was created. Use **Test** in the Alerts dialog to send a sample message.
+
+The `alert_rules` table is created on first use, so an existing deployment needs no migration.
 
 ## Optional: custom domain
 

@@ -238,8 +238,8 @@ footer{border-top:1px solid var(--border-soft);padding:34px 0 46px;color:var(--t
         <div class="feat">
           <div class="ico">◔</div>
           <h3>Syncs itself, tells Slack</h3>
-          <p>A daily cron pulls fresh data. Optional Slack alerts fire on large transactions and low balances,
-          deduplicated so one event does not arrive five times.</p>
+          <p>A daily cron pulls fresh data. Alert rules you set in the dashboard post to Slack when a transaction
+          matches: a paycheck lands, a charge tops $500, money arrives in another currency. Each fires once.</p>
         </div>
         <div class="feat">
           <div class="ico">⌂</div>
@@ -313,10 +313,18 @@ footer{border-top:1px solid var(--border-soft);padding:34px 0 46px;color:var(--t
             figure instead of an invented one.</p>
           </div>
         </div>
+        <div class="gcard">
+          <img src="alerts.png" alt="The alerts dialog with three rules, each with an on switch, Test, Edit and Delete">
+          <div class="t">
+            <h3>Rules that post to Slack</h3>
+            <p>Match on money in or out, account, currency, amount, category or merchant. Each rule can post to its
+            own channel, and the form shows how many of your last 90 days would have matched before you save.</p>
+          </div>
+        </div>
         <div class="gcard phones">
           <div class="row">
             <img src="mobile.png" alt="The dashboard on a phone in dark mode, with an app bar and tiles stacked in one column" width="780" height="1688" loading="lazy">
-            <img src="mobile-menu.png" alt="The phone menu open: Link a bank, Sync now, Credit limits, Categories and sign out" width="780" height="1688" loading="lazy">
+            <img src="mobile-menu.png" alt="The phone menu open: Link a bank, Sync now, Credit limits, Categories, Alerts and sign out" width="780" height="1688" loading="lazy">
             <img src="mobile-light.png" alt="The dashboard on a phone in light mode" width="780" height="1688" loading="lazy">
           </div>
           <div class="t">

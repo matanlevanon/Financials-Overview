@@ -37,11 +37,17 @@ Some issuers do not report a credit line through Plaid. Enter yours and utilisat
 
 ![Credit limits](docs/limits.png)
 
+Alert rules post to Slack when a new transaction matches. Match on money in or out, account, currency, minimum amount, category and merchant text. Each rule can post to its own channel, and the dialog shows how many of your last 90 days of transactions would have matched before you save.
+
+![The alerts dialog with three rules](docs/alerts.png)
+
+![A new rule with the 90-day match preview](docs/alerts-form.png)
+
 Sign-in is restricted to the email addresses you allowlist.
 
 <img src="docs/login.png" alt="Sign in" width="520">
 
-On a phone the three columns stack into one and the header becomes an app bar. The round button switches between light and dark, and the page remembers your choice. The menu holds Link a bank, Sync now, Credit limits and Categories. Tap targets are sized for a thumb and the text reads without zooming. Same data, same filters.
+On a phone the three columns stack into one and the header becomes an app bar. The round button switches between light and dark, and the page remembers your choice. The menu holds Link a bank, Sync now, Credit limits, Categories and Alerts. Tap targets are sized for a thumb and the text reads without zooming. Same data, same filters.
 
 <p>
   <img src="docs/mobile.png" alt="Mobile layout in dark mode" width="250">
@@ -105,6 +111,8 @@ Most of the work here went into not showing confident numbers that are wrong. Fo
 **Card payments are excluded from spending.** Paying a card off appears twice in Plaid data, once leaving the bank account and once arriving at the card. Counted as spending, one monthly payment cycle dwarfs real purchases. Transfers are tagged and stripped from every spending calculation.
 
 **Utilisation ignores cards with unknown limits.** Some issuers report a credit line, some do not. Substituting the balance, or any other stand-in, invents a denominator. Cards without a known limit are left out of the percentage and reported separately, so you see what the number excludes.
+
+**Alert rules only look forward.** A sync re-sends the last `SYNC_DAYS` of transactions every time. A new rule therefore only matches transactions dated from three days before you created it, or the first sync after saving would post months of history. Each rule fires once per transaction, and a post Slack rejects is retried on the next sync.
 
 **Pending transactions are replaced, not duplicated.** When a pending charge posts, Plaid issues a new transaction ID and points `pending_transaction_id` at the old one. Ignore that and both copies survive, so every pending purchase counts twice. The sync deletes the superseded row.
 
