@@ -132,6 +132,7 @@ Review the code before you deploy it. This handles your bank data.
 - Single user per deployment. No multi-tenant mode.
 - Plaid Trial caps you at 10 linked institutions. Removing one does not free a slot.
 - US and Canadian banks only, through Plaid.
+- No currency conversion. A bank that holds several currencies shows one row in Where the money sits with a line per currency in its own money. The bank total counts only the dollar balance.
 - Capital One does not report credit limits or available credit through Plaid. Enter those in the Credit limits dialog.
 - Chase and Capital One are OAuth institutions and need `PLAID_REDIRECT_URI`. Chase also requires a security questionnaire before granting OAuth access, and approval takes time.
 - Transaction history is limited to `SYNC_DAYS`, default 180.

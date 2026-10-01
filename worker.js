@@ -1045,6 +1045,16 @@ button:disabled{opacity:.5;cursor:default}
 .fill{height:100%;border-radius:3px}
 .meta{font-size:9.5px;color:var(--muted);margin-top:3px;display:flex;align-items:center;gap:6px;flex-wrap:wrap}
 .badge{font-size:9px;border:1px solid var(--border);border-radius:3px;padding:0 4px;color:var(--muted)}
+.row.grp{cursor:default}
+.subs{margin-top:6px;display:flex;flex-direction:column;gap:1px}
+.sub{display:flex;justify-content:space-between;align-items:baseline;gap:8px;font-size:10.5px;
+  padding:3px 6px;border-radius:4px;cursor:pointer;border:1px solid transparent}
+.sub:hover{background:var(--sel)}
+.sub.nolink{cursor:default}.sub.nolink:hover{background:none}
+.sub.sel{background:var(--sel);border-color:var(--sel-line)}
+.sub-cur{color:var(--muted);font-weight:600;letter-spacing:.04em}
+.sub-val{color:var(--text-primary);font-variant-numeric:tabular-nums}
+@media(max-width:700px){.sub{font-size:13px;padding:7px 8px}}
 
 /* category pills, colour is redundant: the label is always present */
 .pill{display:inline-flex;align-items:center;gap:4px;font-size:9.5px;padding:1px 6px;border-radius:4px;
@@ -1481,15 +1491,50 @@ function render(){
       (util==null?'No limits known':money0(knownDebt)+' of '+money0(knownLimit))+
       (hiddenDebt>0?'<br>'+money0(hiddenDebt)+' excluded':"")+'</div></div>';
 
-  const maxA=Math.max(...assets.map(a=>a.bal),0);
+  // A bank that holds money in more than one currency (Wise, a dollar account
+  // next to a euro one) folds into one row with a line per currency. There is
+  // no exchange rate here, so the bank row totals only the home currency and
+  // each other currency stays in its own money rather than being added as
+  // dollars. Single-currency banks keep one row per account, as before.
+  const HOME="USD";
+  const curSym={USD:"$",EUR:"\u20AC",GBP:"\u00A3",CAD:"CA$",ILS:"\u20AA"};
+  const fmtCur=(c,n)=>(curSym[c]||c+" ")+money(n);
+  const bySrc={};
+  for(const a of assets) (bySrc[a.src]=bySrc[a.src]||[]).push(a);
+  const rows=[];
+  for(const a of assets){
+    const sib=bySrc[a.src], curs=new Set(sib.map(x=>x.cur||HOME));
+    if(curs.size<2){ rows.push({single:a,total:a.bal}); continue; }
+    if(sib[0]!==a) continue;
+    const per={};
+    for(const x of sib){ const c=x.cur||HOME; (per[c]=per[c]||{cur:c,total:0,ids:[]}); per[c].total+=x.bal; per[c].ids.push(x.id); }
+    const list=Object.values(per).sort((x,y)=>(x.cur===HOME?-1:y.cur===HOME?1:y.total-x.total));
+    rows.push({group:a.src,members:sib,list,total:per[HOME]?per[HOME].total:0});
+  }
+  rows.sort((x,y)=>y.total-x.total);
+  const maxA=Math.max(...rows.map(r=>r.total),0);
   document.getElementById("capAssets").textContent="Click one to filter.";
-  document.getElementById("assets").innerHTML=assets.length?assets.map((a,i)=>{
-    const sel=state.account===a.id, dim=!sel&&!acctHasCat(a.id,state.category);
-    return '<div class="row '+(sel?"sel":"")+' '+(dim?"dim":"")+'" data-acct="'+esc(a.id)+'">'+
-      '<div class="row-top"><span class="row-name">'+esc(a.name)+'</span>'+
-      '<span class="row-val">'+money0(a.bal)+'</span></div>'+
-      (a.bal>0?'<div class="track"><div class="fill" style="width:'+(maxA?a.bal/maxA*100:0).toFixed(1)+
-        '%;background:'+RAMP[Math.min(i,4)]+'"></div></div>':'<div class="meta">Empty</div>')+'</div>';
+  document.getElementById("assets").innerHTML=rows.length?rows.map((r,i)=>{
+    const bar=r.total>0?'<div class="track"><div class="fill" style="width:'+(maxA?r.total/maxA*100:0).toFixed(1)+
+        '%;background:'+RAMP[Math.min(i,4)]+'"></div></div>':"";
+    if(r.single){
+      const a=r.single, sel=state.account===a.id, dim=!sel&&!acctHasCat(a.id,state.category);
+      return '<div class="row '+(sel?"sel":"")+' '+(dim?"dim":"")+'" data-acct="'+esc(a.id)+'">'+
+        '<div class="row-top"><span class="row-name">'+esc(a.name)+'</span>'+
+        '<span class="row-val">'+money0(a.bal)+'</span></div>'+(bar||'<div class="meta">Empty</div>')+'</div>';
+    }
+    const sel=r.members.some(m=>m.id===state.account);
+    const dim=!sel&&!r.members.some(m=>acctHasCat(m.id,state.category));
+    const subs='<div class="subs">'+r.list.map(c=>{
+      const one=c.ids.length===1, on=one&&state.account===c.ids[0];
+      return '<div class="sub'+(on?" sel":"")+(one?"":" nolink")+'"'+(one?' data-acct="'+esc(c.ids[0])+'"':"")+'>'+
+        '<span class="sub-cur">'+esc(c.cur)+'</span><span class="sub-val">'+fmtCur(c.cur,c.total)+'</span></div>';
+    }).join("")+'</div>';
+    const others=r.list.filter(c=>c.cur!==HOME).length;
+    return '<div class="row grp '+(sel?"sel":"")+' '+(dim?"dim":"")+'">'+
+      '<div class="row-top"><span class="row-name">'+esc(r.group)+'</span>'+
+      '<span class="row-val">'+money0(r.total)+'</span></div>'+bar+
+      '<div class="meta">'+others+' other '+(others===1?"currency":"currencies")+', not converted</div>'+subs+'</div>';
   }).join(""):'<div class="empty">Nothing linked yet.</div>';
 
   document.getElementById("capCards").textContent="Balance against limit.";
